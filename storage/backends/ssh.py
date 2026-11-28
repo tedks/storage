@@ -23,6 +23,8 @@ from .base import (
     MemberSourceMissing,
     StorageMemberCapabilities,
     WatcherSpec,
+    copy_bounded_stream,
+    current_copy_bound,
 )
 from .ssh_pool import (
     CommandTimeout, MemberConnection, SFTPLease, is_connection_error, is_transient_oserror,
@@ -127,6 +129,8 @@ class SSHBackend(Backend):
     One SSH transport per member, shared by every thread through a leased
     pool of SFTP channels (see ssh_pool.MemberConnection).
     """
+
+    supports_bounded_copy = True
 
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
@@ -565,8 +569,22 @@ class SSHBackend(Backend):
         # Ensure local parent directory exists
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._with_sftp("copy_to_local", virtual_path,
-                        lambda sftp: sftp.get(remote_path, str(local_path)),
+        bound = current_copy_bound()
+        if bound is None:
+            self._with_sftp("copy_to_local", virtual_path,
+                            lambda sftp: sftp.get(remote_path, str(local_path)),
+                            timeout=self.sftp_operation_timeout, retry=True)
+            return
+
+        def bounded(sftp):
+            # One open of the remote file, at most bound.cap bytes and one
+            # probe read (CopyBound); no prefetch, which would read ahead
+            # without a bound. A retry after a lost connection starts over.
+            bound.grew, bound.read, bound.written = False, 0, 0
+            with sftp.open(remote_path, "rb") as fin, open(local_path, "wb") as fout:
+                copy_bounded_stream(fin.read, fout.write, bound)
+
+        self._with_sftp("copy_to_local", virtual_path, bounded,
                         timeout=self.sftp_operation_timeout, retry=True)
 
     def copy_from_local(self, local_path: Path, virtual_path: str):

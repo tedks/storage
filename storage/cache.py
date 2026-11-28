@@ -17,11 +17,12 @@ from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Callable, ContextManager, Optional, List, Set
 
-from .backends.base import Backend, bulk_request
+from .backends.base import Backend, bounded_copy, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PARTIAL_SUFFIX, PREFIX_XATTR, MemberVersion, confirm_member_stat, copy_member_attributes,
-    has_version_token, regular_file_stat, write_cache_metadata,
+    PARTIAL_SUFFIX, PREFIX_XATTR, FillAction, MemberVersion, confirm_member_stat,
+    copy_member_attributes, fill_action, has_version_token, regular_file_stat,
+    write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -610,6 +611,14 @@ class CacheManager:
             with self._lock:
                 self._reserved_bytes -= file_size
 
+    def fill_errno_noted(self) -> bool:
+        return getattr(self._fill_errno, "code", None) is not None
+
+    def note_fill_errno(self, code: int) -> None:
+        """Record why this thread's fill failed, unless the fill already did."""
+        if getattr(self._fill_errno, "code", None) is None:
+            self._fill_errno.code = code
+
     def take_fill_errno(self) -> Optional[int]:
         """The errno this thread's last failed fill reported, once (cleared)."""
         code = getattr(self._fill_errno, "code", None)
@@ -659,10 +668,21 @@ class CacheManager:
             scans = self._scan_count
         extra_reserved = 0
         try:
+            token_seen = has_version_token(member_stat)
             for attempt in range(2):
                 if attempt:
                     temp_path.unlink(missing_ok=True)
-                with bulk_request() if self.bulk_cold_copies else nullcontext():
+                # The reservation is the copy's bound (CTO-208-BOUNDED): one
+                # open of the source, at most that many bytes, one probe read
+                # for growth. A member that cannot bound its copy gives no
+                # capped fill at all.
+                cap = None if reserved is None else reserved + extra_reserved
+                if cap is not None and not getattr(backend, "supports_bounded_copy", False):
+                    self._fill_errno.code = errno.EAGAIN
+                    raise OSError(errno.EAGAIN, f"{backend.name} cannot bound a copy of "
+                                  f"{source_virtual_path}", source_virtual_path)
+                with bulk_request() if self.bulk_cold_copies else nullcontext(), \
+                        (bounded_copy(cap) if cap is not None else nullcontext()) as bound:
                     backend.copy_to_local(source_virtual_path, temp_path)
                 st = os.lstat(temp_path)
                 if not stat_module.S_ISREG(st.st_mode):
@@ -673,26 +693,32 @@ class CacheManager:
                 if not st.st_mode & stat_module.S_IRUSR:
                     os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
                              follow_symlinks=False)
-                if attempt and reserved is not None and st.st_size > reserved + extra_reserved:
-                    # The retry's version grew again past what is reserved.
-                    print(f"Warning: Insufficient cache space for {source_virtual_path}")
-                    raise OSError(errno.ENOSPC, "the member's version grew past the "
-                                  "cache reservation", source_virtual_path)
                 # The member's stat after the transfer (MemberVersion): an
                 # unconfirmed version gets one more confirmation. Only AGREED
-                # and NEVER_VERSIONED are installed (sticky versioning).
+                # and NEVER_VERSIONED are installed (sticky versioning: once
+                # any stat of this fill carried a token, never NEVER_VERSIONED).
                 newest, version = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
+                token_seen = token_seen or has_version_token(newest)
                 if version == MemberVersion.UNCONFIRMED:
                     newest, version = confirm_member_stat(
                         backend, source_virtual_path, member_stat, st.st_size)
-                if version in (MemberVersion.AGREED, MemberVersion.NEVER_VERSIONED):
+                    token_seen = token_seen or has_version_token(newest)
+                # A stat that showed another version with a token: the only
+                # one a retry may be confirmed against.
+                newer = newest if version == MemberVersion.CHANGED else None
+                if version == MemberVersion.NEVER_VERSIONED and token_seen:
+                    version = MemberVersion.UNCONFIRMED
+                if bound is not None and bound.grew:
+                    # The source outran the bounded copy: another version.
+                    version = MemberVersion.CHANGED
+                if fill_action(version, read_only=False) == FillAction.INSTALL:
                     break
                 # A CHANGED version is fetched once more, only against a
                 # probe and a newer stat that carries a token (it becomes the
-                # retry's probe); anything else fails below.
+                # retry's probe and its bound); anything else fails below.
                 if (attempt or version != MemberVersion.CHANGED or member_stat is None
-                        or not has_version_token(newest)):
+                        or not has_version_token(newer)):
                     break
                 member_stat = newest
                 # Reserve for the retry: the newer stat's size (pre-#191 budget).
@@ -701,23 +727,31 @@ class CacheManager:
                 if more:
                     if not self._reserve_more(more):
                         print(f"Warning: Insufficient cache space for {source_virtual_path}")
+                        self._fill_errno.code = errno.ENOSPC
                         raise OSError(errno.ENOSPC, "insufficient cache space for the "
                                       "member's larger version", source_virtual_path)
                     extra_reserved += more
-            if version not in (MemberVersion.AGREED, MemberVersion.NEVER_VERSIONED):
+            if fill_action(version, read_only=False) != FillAction.INSTALL:
                 # Not a verified generation: nothing is installed, and a copy
                 # already cached (the last good one) stays as it is. The open
-                # reports EAGAIN (unconfirmed, may succeed later) or EIO
-                # (another version than any confirmed: CHANGED).
-                # The open reports EAGAIN (retryable; CTO-208-LIVE-READ). A
-                # read-only opener may take the completed copy privately: it
-                # leaves under a partial name (hidden, swept at startup) and
-                # is never linked into the cache.
-                self._fill_errno.code = errno.EAGAIN
-                if private is not None:
+                # reports EAGAIN (retryable; CTO-208-LIVE-READ). A read-only
+                # opener may take the completed, bounded copy privately: it
+                # leaves under a partial name (hidden, swept at startup), is
+                # never linked into the cache, and takes over this fill's
+                # reservation for its size before cache_file_result releases
+                # its own (no window).
+                if private is not None and cap is not None:
                     kept = temp_path.with_name(f".{secrets.token_hex(8)}.private{PARTIAL_SUFFIX}")
                     os.rename(temp_path, kept)
-                    private.append(kept)
+                    size = os.lstat(kept).st_size
+                    with self._lock:
+                        self._reserved_bytes += size
+                    known = {}
+                    for key in ("st_mode", "st_uid", "st_gid"):
+                        value = getattr(newest, key, None)
+                        known[key] = getattr(member_stat, key, None) if value is None else value
+                    private.append((kept, size, known))
+                self._fill_errno.code = errno.EAGAIN
                 raise OSError(errno.EAGAIN, f"the member's version of {source_virtual_path} "
                               f"could not be confirmed ({version})", source_virtual_path)
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)

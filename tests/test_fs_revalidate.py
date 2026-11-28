@@ -1270,21 +1270,208 @@ class TestLiveRead(RevalidateTestBase):
         self.assertIsNone(self.fs.state_manager.get_file_metadata("/live.log"))
         self.assertEqual(self.partials(), [])
 
-    def test_private_copy_that_does_not_fit_is_removed(self):
+    def test_retry_that_does_not_fit_reports_enospc_and_leaves_nothing(self):
+        # The private copy carries the fill's own reservation; a retry whose
+        # newer version does not fit fails the fill with ENOSPC instead.
         self.rewrite_member("live.log", b"line 1\n")
-        real_reserve, calls = self.fs.cache_manager._reserve_more, []
-
-        def reserve(nbytes):  # the retry's reservation fits, the private copy's does not
-            calls.append(nbytes)
-            return real_reserve(nbytes) if len(calls) == 1 else False
-
         with self.growing_copy(), patch.object(self.fs.cache_manager, "_reserve_more",
-                                               side_effect=reserve):
+                                               return_value=False):
             with self.assertRaises(FuseOSError) as raised:
                 self.fs.open("/live.log", os.O_RDONLY)
-        self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
         self.assertEqual(self.partials(), [])
         self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def appending_during_copy(self, guard=4096):
+        """The member appends after every chunk the bounded copy reads (8-byte
+        chunks), up to guard bytes in all: a writer outrunning the transfer."""
+        from storage.backends import base, local
+        src = self.member_dir / "live.log"
+        real_stream, appended = local.copy_bounded_stream, []
+
+        def stream(read, write, bound):
+            def read_and_grow(n):
+                data = read(n)
+                if sum(appended) < guard:
+                    with open(src, "ab") as f:
+                        f.write(b"+" * 5)
+                    appended.append(5)
+                return data
+            real_stream(read_and_grow, write, bound)
+            self.bounds.append(bound)
+
+        self.bounds = []
+        return [patch.object(base, "COPY_CHUNK", 8), patch.object(local, "copy_bounded_stream", stream)]
+
+    def test_source_appending_during_the_copy_is_served_bounded(self):
+        import contextlib
+        self.rewrite_member("live.log", b"0123456789" * 4)
+        uploads = patch.object(self.member, "copy_from_local",
+                               side_effect=AssertionError("upload of a private copy"))
+        with contextlib.ExitStack() as stack:
+            for patcher in self.appending_during_copy() + [uploads]:
+                stack.enter_context(patcher)
+            # Writable: no baseline to edit, EAGAIN.
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDWR)
+            self.assertEqual(raised.exception.errno, errno.EAGAIN)
+            # Cold read-only: exactly the bounded copy, its EOF the cap.
+            fh = self.fs.open("/live.log", os.O_RDONLY)
+            try:
+                bound = self.bounds[-1]
+                data = self.fs.read("/live.log", 1 << 20, 0, fh)
+                self.assertEqual(len(data), bound.cap)
+                self.assertEqual(self.fs.getattr("/live.log", fh)["st_size"], bound.cap)
+                self.assertTrue(bound.grew)
+                self.assertLessEqual(bound.read, bound.cap + 1)
+                self.assertEqual(data, (self.member_dir / "live.log").read_bytes()[:bound.cap])
+            finally:
+                self.fs.release("/live.log", fh)
+        self.assertFalse((self.cache_dir / "live.log").exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/live.log"))
+        self.assertEqual(self.partials(), [])
+
+    def test_growth_the_stats_do_not_show_still_blocks_publication(self):
+        # The member's stat keeps reporting the probed version (a lagging
+        # stat), but the bounded copy saw bytes past it: not published.
+        import contextlib
+        self.rewrite_member("live.log", b"0123456789" * 4)
+        probe = self.member.stat("/live.log")
+        with contextlib.ExitStack() as stack:
+            for patcher in self.appending_during_copy() + [
+                    patch.object(self.member, "stat", return_value=probe)]:
+                stack.enter_context(patcher)
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDWR)
+        self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        self.assertTrue(self.bounds[-1].grew)
+        self.assertFalse((self.cache_dir / "live.log").exists())
+
+    def test_source_appending_during_a_refresh_keeps_serving_last_good(self):
+        import contextlib
+        self.rewrite_member("live.log", b"version 1", mtime=1_000_000_000)
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.rewrite_member("live.log", b"version 2 grows", mtime=1_100_000_000)
+        self.age_checks()
+        with contextlib.ExitStack() as stack:
+            for patcher in self.appending_during_copy():
+                stack.enter_context(patcher)
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertTrue(all(b.written <= b.cap for b in self.bounds))
+
+    def test_private_copy_of_a_member_without_owner_read_is_refused(self):
+        real = self.member.stat
+        for mode in (0o200, 0o040):
+            with self.subTest(mode=oct(mode)):
+                self.rewrite_member("live.log", b"line 1\n")
+
+                def reported(path, mode=mode):
+                    st = real(path)
+                    return SimpleNamespace(st_size=st.st_size, st_mtime_ns=st.st_mtime_ns,
+                                           st_mtime=st.st_mtime, st_mode=stat.S_IFREG | mode)
+
+                with self.growing_copy(), patch.object(self.member, "stat", side_effect=reported):
+                    with self.assertRaises(FuseOSError) as raised:
+                        self.fs.open("/live.log", os.O_RDONLY)
+                self.assertEqual(raised.exception.errno, errno.EACCES)
+                self.assertEqual(self.partials(), [])
+                self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def test_private_copy_carries_the_fills_reservation(self):
+        self.rewrite_member("live.log", b"line 1\n")
+        reserve_more = self.fs.cache_manager._reserve_more
+        calls = []
+
+        def counted(nbytes):
+            calls.append(nbytes)
+            return reserve_more(nbytes)
+
+        with self.growing_copy(), patch.object(self.fs.cache_manager, "_reserve_more",
+                                               side_effect=counted):
+            fh = self.fs.open("/live.log", os.O_RDONLY)
+        try:
+            size = self.fs.getattr("/live.log", fh)["st_size"]
+            self.assertEqual(self.fs.cache_manager._reserved_bytes, size)
+            self.assertEqual(len(calls), 1)  # the retry's; none taken again for the copy
+        finally:
+            self.fs.release("/live.log", fh)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def test_a_failed_private_rename_keeps_its_errno(self):
+        self.rewrite_member("live.log", b"line 1\n")
+        import storage.cache as cache_module
+        real_rename = os.rename
+
+        def rename(src, dst, *a, **kw):
+            if ".private" in str(dst):
+                raise OSError(errno.EXDEV, "cross-device")
+            return real_rename(src, dst, *a, **kw)
+
+        with self.growing_copy(), patch.object(cache_module.os, "rename", side_effect=rename):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EXDEV)
+        self.assertEqual(self.partials(), [])
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def test_private_copy_whose_name_cannot_be_removed_still_closes_clean(self):
+        self.rewrite_member("live.log", b"line 1\n")
+        real_unlink = Path.unlink
+
+        def unlink(path, *a, **kw):
+            if ".private" in path.name:
+                raise OSError(errno.EBUSY, "busy")
+            return real_unlink(path, *a, **kw)
+
+        with self.growing_copy(), patch.object(Path, "unlink", unlink), \
+                self.assertLogs("storage.fs", level="WARNING"):
+            fh = self.fs.open("/live.log", os.O_RDONLY)
+            self.assertEqual(self.fs.read("/live.log", 1 << 20, 0, fh)[:6], b"line 1")
+            self.fs.release("/live.log", fh)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+        with self.fs._fd_lock:
+            self.assertEqual(self.fs._fd_map, {})
+        for leftover in self.cache_dir.rglob("*.private*"):
+            leftover.unlink()  # the startup sweep would take it
+
+    def test_a_token_seen_in_the_first_confirmation_sticks(self):
+        # B4: a size-only probe, a tokened first confirmation, then a
+        # size-only or failing second one: never installed.
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        real = self.member.stat
+        for second in ("size-only", "fails"):
+            with self.subTest(second=second):
+                seen = []
+
+                def stats(path):
+                    seen.append(path)
+                    st = real(path)
+                    if len(seen) == 2:
+                        return st  # the first confirmation has a token
+                    if len(seen) == 3 and second == "fails":
+                        raise OSError(errno.EIO, "stat failed")
+                    return SimpleNamespace(st_size=st.st_size)
+
+                with patch.object(self.member, "stat", side_effect=stats):
+                    with self.assertRaises(FuseOSError) as raised:
+                        self.fs.open("/f.txt", os.O_WRONLY)
+                self.assertEqual(raised.exception.errno, errno.EAGAIN)
+                self.assertFalse((self.cache_dir / "f.txt").exists())
+
+    def test_last_good_that_cannot_be_kept_aside_is_not_dropped(self):
+        self.rewrite_member("live.log", b"version 1", mtime=1_000_000_000)
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.rewrite_member("live.log", b"version 2!", mtime=1_100_000_000)
+        self.age_checks()
+        import storage.fs as fs_module
+        with patch.object(fs_module.os, "link", side_effect=OSError(errno.EMLINK, "links")), \
+                self.count_fetches() as fetches:
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDWR)
+            self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        self.assertEqual(fetches.call_count, 0)
+        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 1")
 
     def test_writable_open_retries_then_eagain_and_a_stable_version_publishes(self):
         self.rewrite_member("live.log", b"line 1\n")

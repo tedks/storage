@@ -2197,6 +2197,17 @@ class StorageFS(Operations):
                 # A stream or a writer won. Their inode, source baseline
                 # and state rows belong to them, even for an unindexed prefix.
                 return True
+            if outcome == CacheFetch.FAILED:
+                # cache_file_result reports two failures without an errno
+                # (its mapping stays as it is, #191): a member that does not
+                # have the file (ENOENT, confirmed here) and a reservation
+                # that did not fit (ENOSPC).
+                if not self.cache_manager.fill_errno_noted():
+                    try:
+                        present = backend.exists(canonical_path)
+                    except Exception:  # noqa: BLE001 - cannot confirm absence
+                        present = True
+                    self.cache_manager.note_fill_errno(errno.ENOSPC if present else errno.ENOENT)
             if outcome == CacheFetch.INSTALLED:
                 # Fresh from the member: no check needed until revalidate_after.
                 # The baseline is the stat the copy was confirmed against (the
@@ -2309,7 +2320,8 @@ class StorageFS(Operations):
         if not available_backends and self.backends:
             raise FuseOSError(errno.EHOSTUNREACH)
 
-        # File not available
+        # File not available: no member holds it (unless a fill said why).
+        self.cache_manager.note_fill_errno(errno.ENOENT)
         return False
 
     # Filesystem methods
@@ -2734,35 +2746,41 @@ class StorageFS(Operations):
                 )
 
         # Fallback path: preserve existing full-file cache semantics.
-        private_size = None
+        private_size = private_attrs = None
         if prefetch_session is None:
             self.cache_manager.take_fill_errno()
             read_only = self._is_read_only_open(flags)
             private: Optional[list] = [] if read_only and not resolved.backend_name else None
-            if self._ensure_file_in_cache(resolved, private=private):
-                self._settle_last_good(resolved, reinstate=False)
-                cache_path = resolved.cache_path
-            else:
-                # Not installed (fill_action): an unverified version gives
-                # EAGAIN, a plain failure ENOENT. A copy the revalidation
-                # dropped goes back, and a read-only opener keeps reading
-                # it; with none, it may read the completed copy privately.
-                code = self.cache_manager.take_fill_errno() or errno.ENOENT
-                had_last_good = resolved.canonical_path in self._last_good
-                self._settle_last_good(resolved, reinstate=True)
-                kept_copy = private[0] if private else None
-                if read_only and had_last_good and self.cache_manager.is_cached(
-                        resolved.requested_path):
-                    self._drop_private_copy(kept_copy)
+            try:
+                if self._ensure_file_in_cache(resolved, private=private):
+                    self._settle_last_good(resolved, reinstate=False)
                     cache_path = resolved.cache_path
-                elif read_only and kept_copy is not None:
-                    private_size = self._reserve_private_copy(kept_copy)
-                    if private_size is None:
-                        raise FuseOSError(errno.EAGAIN)
-                    cache_path = kept_copy
                 else:
-                    self._drop_private_copy(kept_copy)
-                    raise FuseOSError(code)
+                    # Not installed (fill_action): an unverified version gives
+                    # EAGAIN; otherwise the fill's own errno. A copy the
+                    # revalidation dropped goes back, and a read-only opener
+                    # keeps reading it; with none, it may read the completed,
+                    # bounded copy privately.
+                    code = self.cache_manager.take_fill_errno() or errno.EIO
+                    had_last_good = resolved.canonical_path in self._last_good
+                    self._settle_last_good(resolved, reinstate=True)
+                    if read_only and had_last_good and self.cache_manager.is_cached(
+                            resolved.requested_path):
+                        cache_path = resolved.cache_path
+                    elif read_only and private:
+                        copy, size, known = private[0]
+                        mode = known.get("st_mode")
+                        if (os.geteuid() != 0 and type(mode) is int
+                                and not mode & stat.S_IRUSR):
+                            raise FuseOSError(errno.EACCES)
+                        private.pop(0)  # served: this descriptor owns it now
+                        cache_path, private_size, private_attrs = copy, size, known
+                    else:
+                        raise FuseOSError(code)
+            finally:
+                for copy, size, _known in private or ():
+                    self._drop_private_copy(copy)
+                    self.cache_manager.release_reserved(size)
             if private_size is None:
                 if not self._is_read_only_open(flags):
                     self._require_imported_write_permission(cache_path)
@@ -2796,6 +2814,7 @@ class StorageFS(Operations):
                     prefetch_session=prefetch_session,
                     view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
                     private_size=private_size,
+                    private_attrs=private_attrs,
                 )
             if private_size is not None:
                 # The descriptor holds the copy; its name goes at once, so
@@ -2819,26 +2838,16 @@ class StorageFS(Operations):
                 self.cache_manager.release_reserved(private_size)
             raise FuseOSError(e.errno)
 
-    def _reserve_private_copy(self, copy: Path) -> Optional[int]:
-        """Account a private copy's captured length in the cache budget for
-        as long as its descriptor is open; None (copy removed) if it does
-        not fit."""
-        try:
-            size = os.lstat(copy).st_size
-        except OSError:
-            return None
-        if not self.cache_manager._reserve_more(size):
-            self._drop_private_copy(copy)
-            return None
-        return size
-
-    @staticmethod
-    def _drop_private_copy(copy: Optional[Path]) -> None:
+    def _drop_private_copy(self, copy: Optional[Path]) -> None:
+        """Unlink a private copy's name; a failure is logged (the startup
+        sweep removes partial names), never raised past the descriptor."""
         if copy is not None:
             try:
                 copy.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                self.logger.warning("could not remove the private copy %s: %s", copy, exc)
 
     def create(self, path, mode, fi=None):
         """Create a file"""

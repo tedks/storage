@@ -1930,7 +1930,8 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.addCleanup(fs.sync_manager.stop)
         holders = [_Holder(backend._pool) for _ in range(3)]
         copy_entered = threading.Event()
-        self.server.hooks["get"] = lambda _client, _path: copy_entered.set()
+        # A capped cold copy is one bounded sftp.open of the file (CTO-208-BOUNDED).
+        self.server.hooks["open"] = lambda _client, _path: copy_entered.set()
         opener = None
         try:
             self.assertFalse(fs.cache_manager.bulk_cold_copies)
@@ -1990,7 +1991,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             if not release.wait(30):
                 raise AssertionError("copy gate was not released")
 
-        self.server.hooks["get"] = hold_copy
+        self.server.hooks["open"] = hold_copy
         self.server.hooks["listdir_attr"] = lambda _client, _path: listing.set()
         workers = []
         browser = None
@@ -2133,7 +2134,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
                 self.assertFalse(fs.cache_manager.is_cached("/cold"))
                 self.assertIsNone(fs.state_manager.get_file_metadata("/cold"))
-                self.assertFalse(any(name == "get" for name, *_ in self.server.requests))
+                self.assertFalse(any(name == "open" for name, *_ in self.server.requests))
 
                 # The failed open installed no cache entry. With only the
                 # copy's bulk scope disabled, the same file uses the spare
@@ -2145,7 +2146,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                     finally:
                         fs("release", "/cold", fd)
                 self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
-                self.assertEqual(1, sum(name == "get" for name, *_ in self.server.requests))
+                self.assertEqual(1, sum(name == "open" for name, *_ in self.server.requests))
                 self.assertTrue(fs.cache_manager.is_cached("/cold"))
                 self.assertIsNotNone(fs.state_manager.get_file_metadata("/cold"))
         except BaseException as exc:

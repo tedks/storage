@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import tempfile
@@ -234,6 +235,113 @@ class _GatedBackend(LocalBackend):
             if self.fail:
                 raise OSError("member went away mid-transfer")
             f.write(data[len(data) // 2:])
+
+
+class TestBoundedCopy(unittest.TestCase):
+    """CTO-208-BOUNDED: a capped copy_to_local reads one open of the source
+    and stops at the cap, however fast a writer appends (here after every
+    chunk read, with the producer capped at a guard)."""
+
+    CAP, GUARD = 40, 10_000
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+
+    def appending_reader(self, read, append):
+        """read() that appends to the source after every chunk it returns."""
+        appended = []
+
+        def read_and_grow(n):
+            data = read(n)
+            if sum(appended) < self.GUARD:
+                appended.append(append())
+            return data
+        return read_and_grow
+
+    def check(self, bound, dst):
+        self.assertTrue(bound.grew)
+        self.assertLessEqual(bound.written, self.CAP)
+        self.assertLessEqual(bound.read, self.CAP + 1)
+        self.assertEqual(dst.stat().st_size, self.CAP)
+
+    def test_local_member_copy_stops_at_the_cap(self):
+        from storage.backends import base, local
+        root = self.temp_dir / "member"
+        root.mkdir()
+        src = root / "f.log"
+        src.write_bytes(b"x" * self.CAP)
+        backend = LocalBackend("m", str(root))
+        real_stream = local.copy_bounded_stream
+
+        def stream(read, write, bound):
+            def append():
+                with open(src, "ab") as f:
+                    f.write(b"+" * 7)
+                return 7
+            return real_stream(self.appending_reader(read, append), write, bound)
+
+        dst = self.temp_dir / "copy"
+        with patch.object(base, "COPY_CHUNK", 8), patch.object(local, "copy_bounded_stream", stream), \
+                base.bounded_copy(self.CAP) as bound:
+            backend.copy_to_local("/f.log", dst)
+        self.check(bound, dst)
+        self.assertEqual(dst.read_bytes(), b"x" * self.CAP)
+
+    def test_ssh_member_copy_stops_at_the_cap(self):
+        from types import SimpleNamespace
+        from storage.backends import base
+        from storage.backends.ssh import SSHBackend
+        data = bytearray(b"y" * self.CAP)
+        offset = {"at": 0}
+
+        class GrowingRemote:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n):
+                chunk = bytes(data[offset["at"]:offset["at"] + n])
+                offset["at"] += len(chunk)
+                return chunk
+
+        remote = GrowingRemote()
+        remote.read = self.appending_reader(remote.read, lambda: data.extend(b"+" * 7) or 7)
+        sftp = SimpleNamespace(open=lambda path, mode: remote,
+                               get=lambda *a: self.fail("an unbounded get"))
+        backend = SSHBackend.__new__(SSHBackend)
+        backend._resolve_path = lambda path: "/remote" + path
+        backend.sftp_operation_timeout = 1.0
+        backend._with_sftp = lambda what, path, fn, **kw: fn(sftp)
+        dst = self.temp_dir / "copy"
+        with patch.object(base, "COPY_CHUNK", 8), base.bounded_copy(self.CAP) as bound:
+            backend.copy_to_local("/f.log", dst)
+        self.check(bound, dst)
+
+    def test_a_source_of_exactly_the_cap_copies_whole(self):
+        from storage.backends import base
+        root = self.temp_dir / "member"
+        root.mkdir()
+        (root / "f.log").write_bytes(b"z" * self.CAP)
+        dst = self.temp_dir / "copy"
+        with base.bounded_copy(self.CAP) as bound:
+            LocalBackend("m", str(root)).copy_to_local("/f.log", dst)
+        self.assertFalse(bound.grew)
+        self.assertEqual(dst.read_bytes(), b"z" * self.CAP)
+
+    def test_a_member_that_cannot_bound_its_copy_gives_eagain(self):
+        state = StateManager(str(self.temp_dir / "state.db"))
+        self.addCleanup(state.close)
+        cache = CacheManager(self.temp_dir / "cache", state, 10_000)
+        backend = LocalBackend("m", str(self.temp_dir))
+        (self.temp_dir / "f.log").write_bytes(b"abc")
+        with patch.object(LocalBackend, "supports_bounded_copy", False), \
+                patch.object(backend, "copy_to_local",
+                             side_effect=AssertionError("an unbounded copy")):
+            self.assertFalse(cache.cache_file("/f.log", backend))
+        self.assertEqual(cache.take_fill_errno(), errno.EAGAIN)
 
 
 class TestConfirmedLargerRetryBudget(unittest.TestCase):

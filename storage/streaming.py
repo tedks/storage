@@ -21,7 +21,8 @@ from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PREFIX_XATTR, MemberVersion, confirm_member_stat, copy_member_attributes,
+    PREFIX_XATTR, FillAction, MemberVersion, confirm_member_stat, copy_member_attributes,
+    fill_action,
 )
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
@@ -1653,7 +1654,9 @@ class StreamingReadManager:
             # simplest correct choice: the next open fetches again.) A
             # member that never supplied a token keeps its stream, with
             # only the attributes it reported.
-            if version in (MemberVersion.CHANGED, MemberVersion.UNCONFIRMED):
+            # (fill_action: a stream's readers already have their bytes, so a
+            # copy that may not be installed is simply not kept.)
+            if fill_action(version, read_only=True) != FillAction.INSTALL:
                 reason = ("member-changed" if version == MemberVersion.CHANGED
                           else "member-unconfirmed")
                 self._discard_superseded_session(session, reason)
