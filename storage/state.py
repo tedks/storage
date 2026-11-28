@@ -382,38 +382,24 @@ class StateManager:
         *,
         size: int,
         last_modified: float,
-        clear_checksum: bool = False,
-        durable: bool = False,
     ) -> bool:
         """Bring a row's recorded stat up to a cache file that holds synced content.
 
         After a refetch, the row's stat must describe the cached inode or
-        it will look like a lost write; a recomputable eviction records its
-        placeholder the same way. Touches only the size and mtime (and the
-        checksum when `clear_checksum`), and only WHERE dirty_generation =
-        `generation`, so a write recorded since the caller read the row is
-        left alone. `durable` commits with synchronous=FULL, so the record
-        is on disk before the caller acts on it (the WAL is otherwise
-        synced only at checkpoints). Returns whether it applied.
+        it will look like a lost write. Touches only the size and mtime,
+        and only WHERE dirty_generation = `generation`, so a write recorded
+        since the caller read the row is left alone. Returns whether it applied.
         """
-        checksum_sql = ", checksum = NULL" if clear_checksum else ""
         with self._db_lock:
-            previous = self.conn.execute('PRAGMA synchronous').fetchone()[0] if durable else None
-            try:
-                if durable:
-                    self.conn.execute('PRAGMA synchronous = FULL')
-                cursor = self.conn.execute(
-                    f'''
-                    UPDATE files
-                    SET size = ?, last_modified = ?{checksum_sql}
-                    WHERE virtual_path = ? AND dirty_generation = ?
-                    ''',
-                    (size, last_modified, virtual_path, generation),
-                )
-                self.conn.commit()
-            finally:
-                if durable:
-                    self.conn.execute(f'PRAGMA synchronous = {int(previous)}')
+            cursor = self.conn.execute(
+                '''
+                UPDATE files
+                SET size = ?, last_modified = ?
+                WHERE virtual_path = ? AND dirty_generation = ?
+                ''',
+                (size, last_modified, virtual_path, generation),
+            )
+            self.conn.commit()
             return cursor.rowcount == 1
 
     def publish_sync_status(

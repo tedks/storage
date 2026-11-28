@@ -19,7 +19,6 @@ from storage.cache_metadata import (
     record_native_attributes,
     read_cache_metadata,
     scan_cache_entries,
-    stat_matches_record,
     write_cache_metadata,
 )
 from storage.models import FileMetadata, SyncStatus
@@ -287,27 +286,6 @@ class TestStaleRecordDerivation(unittest.TestCase):
         self.assertIn("stale_clean_xattr", kinds)
         self.assertIn("size_mismatch", kinds)
         self.assertEqual(entry.build_file_metadata().sync_status, SyncStatus.DIRTY)
-
-
-class TestPlaceholderEquivalence(unittest.TestCase):
-    """An evicted recomputable placeholder matches its record whatever its mtime."""
-
-    def _matches(self, **overrides):
-        args = dict(recorded_size=0, recorded_mtime=1.0, sync_status=SyncStatus.CLEAN,
-                    recomputable=True, stat_size=0, stat_mtime=2.0)
-        args.update(overrides)
-        return stat_matches_record(**args)
-
-    def test_a_clean_recomputable_empty_record_over_an_empty_file_matches(self):
-        self.assertTrue(self._matches())
-
-    def test_only_that_case_tolerates_the_mtime(self):
-        self.assertFalse(self._matches(recomputable=False))
-        self.assertFalse(self._matches(sync_status=SyncStatus.DIRTY))
-        self.assertFalse(self._matches(stat_size=3))  # bytes under a size-0 record
-        self.assertFalse(self._matches(recorded_size=3))  # a lost truncate to zero
-        self.assertTrue(self._matches(recorded_size=3, stat_size=3, stat_mtime=1.0))
-        self.assertFalse(self._matches(recorded_size=3, stat_size=3))
 
 
 class TestCacheScansDoNotFollowLinks(unittest.TestCase):

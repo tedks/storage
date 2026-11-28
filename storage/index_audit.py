@@ -13,7 +13,6 @@ from .cache_metadata import (
     regular_file_stat,
     scan_cache_entries,
     scan_cache_links,
-    stat_matches_record,
     write_cache_metadata,
 )
 from .links import link_checksum
@@ -254,11 +253,9 @@ def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> R
                 # so whatever status the row recorded describes content that
                 # is gone; the same rule as CacheMetadataRecord.to_file_metadata.
                 # The checksum stays: it describes the content last synced.
-                if not stat_matches_record(
-                    recorded_size=metadata.size, recorded_mtime=metadata.last_modified,
-                    sync_status=metadata.sync_status,
-                    recomputable=metadata.recomputable and metadata.link_target is None,
-                    stat_size=entry.stat_size, stat_mtime=entry.stat_mtime,
+                if (
+                    metadata.size != entry.stat_size
+                    or metadata.last_modified != entry.stat_mtime
                 ):
                     metadata.sync_status = SyncStatus.DIRTY
                 metadata.size = entry.stat_size

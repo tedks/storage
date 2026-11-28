@@ -692,7 +692,7 @@ class StorageFS(Operations):
                         # Content not yet sent to its member: kept, as for a writer.
                         return
                     if meta and not resolved.backend_name:
-                        stale = not self.cache_manager.stat_matches_row(meta, st.st_size, st.st_mtime)
+                        stale = st.st_size != meta.size or st.st_mtime != meta.last_modified
                     if not stale:
                         # Before the unlink: no getattr may find the copy
                         # gone and its name still in the parent's listing.
