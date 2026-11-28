@@ -1593,6 +1593,17 @@ class TestFSStreamingIntegration(unittest.TestCase):
                     }))
         self.assertEqual(0, manager.download_limits()["streaming_read_ahead_window"])
 
+        # A percentage too precise to report is refused before it is
+        # installed, so the policy and later gets are unaffected.
+        policy = limits["streaming_keep_after_close"]
+        with self.assertRaisesRegex(ControlError, "decimal places"):
+            request(json.dumps({
+                "command": "streaming.set",
+                "limits": {"streaming_keep_after_close": "all:0." + "0" * 4299 + "1%"},
+            }))
+        self.assertEqual(policy, request(json.dumps({"command": "streaming.get"}))
+                         ["limits"]["streaming_keep_after_close"])
+
         # keep-after-close stays string-only: get reports a structure, not
         # the string set accepts.
         with self.assertRaisesRegex(ControlError, "streaming_keep_after_close"):
