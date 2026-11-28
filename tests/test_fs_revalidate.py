@@ -1801,3 +1801,63 @@ class TestRevalidateFromListing(RevalidateTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecomputeRecordsStat(unittest.TestCase):
+    """A cache-miss recompute over a CLEAN size-0 row leaves its bytes evictable."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.cache_dir = self.temp_dir / "cache"
+        self.cache_dir.mkdir()
+        self.member_dir = self.temp_dir / "member"
+        self.member_dir.mkdir()
+        self.member = LocalBackend("member", str(self.member_dir))
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"member": self.member}, cache_size=10 * 1024 * 1024,
+            start_sync=False,
+        )
+
+    def tearDown(self):
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        shutil.rmtree(self.temp_dir)
+
+    def _recompute(self, output):
+        cache_path = self.cache_dir / "derived.bin"
+
+        def run(virtual_path, path, timeout=None):
+            path.write_bytes(output)
+            return SimpleNamespace(success=True, output="", error="", duration=0.0, timed_out=False)
+
+        engine = self.fs.recompute_engine
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", side_effect=run):
+            self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/derived.bin")))
+        return cache_path
+
+    def _row(self, **changes):
+        self.fs.state_manager.set_file_metadata(dataclasses.replace(FileMetadata(
+            virtual_path="/derived.bin", size=0, checksum=None, last_access=1.0,
+            last_modified=0.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=True, recompute_cmd="make", encrypted=False, encryption_key_id=None,
+        ), **changes))
+
+    def test_cache_miss_recompute_over_a_size_zero_row_becomes_a_candidate(self):
+        self._row()
+        cache_path = self._recompute(b"recomputed bytes")
+        st = cache_path.stat()
+        row = self.fs.state_manager.get_file_metadata("/derived.bin")
+        self.assertEqual((row.size, row.last_modified, row.sync_status),
+                         (st.st_size, st.st_mtime, SyncStatus.CLEAN))
+        self.assertEqual(read_cache_metadata(cache_path).size, st.st_size)
+        self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), ["/derived.bin"])
+        # The stat matches, so the next open does not take it for a lost write.
+        self.assertFalse(self.fs.cache_manager.heal_stale_clean("/derived.bin", cache_path))
+
+    def test_recompute_leaves_a_dirty_row_alone(self):
+        self._row(sync_status=SyncStatus.DIRTY, size=5, last_modified=2.0)
+        self._recompute(b"recomputed bytes")
+        row = self.fs.state_manager.get_file_metadata("/derived.bin")
+        self.assertEqual((row.size, row.last_modified, row.sync_status), (5, 2.0, SyncStatus.DIRTY))

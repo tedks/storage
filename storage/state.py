@@ -257,11 +257,12 @@ class StateManager:
         # virtual_path and the access batch's UPDATE of last_access. An
         # INSERT OR REPLACE re-inserts at the default 0. Every path that
         # places bytes in the cache writes the row after the bytes are in
-        # place: a fetch, a streaming finalize, a create, a write; a
-        # recompute writes no row itself, and is re-admitted by the access
-        # batch's UPDATE that follows the open, which counts as the row
-        # write. Recursive triggers are off (SQLite's default; this module
-        # never sets recursive_triggers), so the clear does not re-fire.
+        # place: a fetch, a streaming finalize, a create, a write, a
+        # recompute over an existing CLEAN row (record_cached_stat). The
+        # access batch's UPDATE that follows an open counts as a row write
+        # too, so any path that writes no row itself is re-admitted by it.
+        # The clear terminates whether or not recursive_triggers is on: its
+        # own 1-to-0 update fails the WHEN.
         self.conn.execute('''
             CREATE TRIGGER IF NOT EXISTS files_cache_absent_clear
             AFTER UPDATE ON files
