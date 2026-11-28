@@ -94,6 +94,7 @@ class FDEntry:
     # copy, never indexed or uploaded, unlinked once the descriptor holds
     # it. private_attrs: the member's mode, uid and gid as last reported.
     private_size: Optional[int] = None
+    private_reservation: Optional[object] = None
     private_attrs: Optional[dict] = None
     # A private copy's name that could not be removed yet: it stays charged
     # until it is (retried at close).
@@ -2729,7 +2730,7 @@ class StorageFS(Operations):
                 )
 
         # Fallback path: preserve existing full-file cache semantics.
-        private_size = private_attrs = None
+        private_size = private_attrs = private_reservation = None
         if prefetch_session is None:
             self.cache_manager.take_fill_errno()
             read_only = self._is_read_only_open(flags)
@@ -2754,19 +2755,20 @@ class StorageFS(Operations):
                             and self.cache_manager.is_cached(resolved.requested_path)):
                         cache_path = resolved.cache_path
                     elif read_only and private:
-                        copy, size, known = private[0]
+                        copy, reservation, known = private[0]
                         mode = known.get("st_mode")
                         if (os.geteuid() != 0 and type(mode) is int
                                 and not mode & stat.S_IRUSR):
                             raise FuseOSError(errno.EACCES)
                         private.pop(0)  # served: this descriptor owns it now
-                        cache_path, private_size, private_attrs = copy, size, known
+                        cache_path, private_attrs = copy, known
+                        private_size, private_reservation = reservation.size, reservation
                     else:
                         raise FuseOSError(code)
             finally:
-                for copy, size, _known in private or ():
+                for copy, reservation, _known in private or ():
                     if self._drop_private_copy(copy):
-                        self.cache_manager.release_reserved(size)
+                        self.cache_manager.release_new_file(reservation)
             if private_size is None:
                 if not self._is_read_only_open(flags):
                     self._require_imported_write_permission(cache_path)
@@ -2800,6 +2802,7 @@ class StorageFS(Operations):
                     prefetch_session=prefetch_session,
                     view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
                     private_size=private_size,
+                    private_reservation=private_reservation,
                     private_attrs=private_attrs,
                 )
             if clear_stale:
@@ -2823,7 +2826,7 @@ class StorageFS(Operations):
             if prefetch_session is not None:
                 self._release_prefetch_session(prefetch_session)
             if private_size is not None and self._drop_private_copy(cache_path):
-                self.cache_manager.release_reserved(private_size)
+                self.cache_manager.release_new_file(private_reservation)
             raise FuseOSError(e.errno)
 
     def _drop_private_copy(self, copy: Optional[Path]) -> bool:
@@ -3075,7 +3078,7 @@ class StorageFS(Operations):
             # gone too (a name that still cannot be removed stays charged
             # until the startup sweep).
             if self._drop_private_copy(entry.private_name):
-                self.cache_manager.release_reserved(entry.private_size)
+                self.cache_manager.release_new_file(entry.private_reservation)
             if close_error is not None:
                 raise FuseOSError(close_error.errno)
             return 0

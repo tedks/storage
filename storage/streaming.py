@@ -1435,6 +1435,17 @@ class StreamingReadManager:
         """The log reason for an _install_partial outcome other than "installed"."""
         return "cache-path-filled" if outcome == "taken" else outcome
 
+    def _discard_unverified(self, session: PrefetchSession, version: str):
+        """Discard a finished stream that fill_action does not install:
+        CHANGED as member-changed, UNCONFIRMED (no stat could confirm the
+        probe's token, an inline or destroy publication that makes no stat,
+        or a confirmation whose wait budget ran out) as member-unconfirmed.
+        Counted once, after the partial is gone and the session finished."""
+        changed = version == MemberVersion.CHANGED
+        self._discard_superseded_session(session, "member-changed" if changed else "member-unconfirmed")
+        self._record_streaming_stat(
+            "streaming_member_changed_discards" if changed else "streaming_unconfirmed_discards", 1)
+
     def _discard_superseded_session(self, session: PrefetchSession, outcome: str):
         """Finish a complete session whose partial was not installed (outcome, see _install_partial).
 
@@ -1607,8 +1618,7 @@ class StreamingReadManager:
             # counts as not agreed and is discarded, and the next open
             # fetches again, so unverified bytes are never published.
             if session.unconfirmed_publication:
-                self._discard_superseded_session(session, "unconfirmed")
-                self._record_streaming_stat("streaming_unconfirmed_discards", 1)
+                self._discard_unverified(session, MemberVersion.UNCONFIRMED)
                 return
             # A worker's stat is an interactive request: the member's
             # interactive reserve and its connect deadline, never a bulk
@@ -1617,10 +1627,9 @@ class StreamingReadManager:
             # confirmations on the reserve; that wait yields under
             # contention and is bounded across yields
             # (_publication_wait_probe).
-            # A deadline failure is retried once, then the probe stands in
-            # when the size matches (confirm_member_stat); what an
-            # unconfirmed result means beyond that is the decision below,
-            # unchanged from master.
+            # A deadline failure is retried once; a stat that still fails is
+            # UNCONFIRMED when the probe carried a version token, never the
+            # probe standing in (CTO-VERSION-EVIDENCE: MemberVersion, below).
             try:
                 with interactive_request():
                     confirmed, version = confirm_member_stat(
@@ -1634,9 +1643,8 @@ class StreamingReadManager:
                     return
                 if session.confirmation_timed_out:
                     # The member's wait budget ran out across attempts:
-                    # unconfirmed, so discarded like any result not agreed.
-                    self._discard_superseded_session(session, "unconfirmed")
-                    self._record_streaming_stat("streaming_unconfirmed_discards", 1)
+                    # UNCONFIRMED, discarded like any result not agreed.
+                    self._discard_unverified(session, MemberVersion.UNCONFIRMED)
                     return
                 if current_interactive_cancel_probe() is not None:
                     # The turn's channel-wait probe gave up under contention.
@@ -1657,13 +1665,7 @@ class StreamingReadManager:
             # (fill_action: a stream's readers already have their bytes, so a
             # copy that may not be installed is simply not kept.)
             if fill_action(version, read_only=True) != FillAction.INSTALL:
-                reason = ("member-changed" if version == MemberVersion.CHANGED
-                          else "member-unconfirmed")
-                self._discard_superseded_session(session, reason)
-                # Counted once the partial is gone and the session finished.
-                self._record_streaming_stat(
-                    "streaming_member_changed_discards" if version == MemberVersion.CHANGED
-                    else "streaming_member_unconfirmed_discards", 1)
+                self._discard_unverified(session, version)
                 return
             if version == MemberVersion.AGREED:
                 session.confirmed_stat = confirmed

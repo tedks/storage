@@ -632,11 +632,6 @@ class CacheManager:
         self._fill_errno.code = None
         return code
 
-    def release_reserved(self, nbytes: int) -> None:
-        """Give back bytes _reserve_more reserved (a private copy closed)."""
-        with self._lock:
-            self._reserved_bytes -= nbytes
-
     def _reserve_more(self, nbytes: int) -> bool:
         """Reserve nbytes more for a fill in progress, if there is room."""
         with self._lock:
@@ -758,17 +753,19 @@ class CacheManager:
                     os.rename(temp_path, kept)
                     try:
                         # Owned from the rename on: a failure here removes it.
-                        size = os.lstat(kept).st_size
+                        kept_st = os.lstat(kept)
                     except BaseException:
                         kept.unlink(missing_ok=True)
                         raise
-                    with self._lock:
-                        self._reserved_bytes += size
+                    # Charged by inode (reserve_new_file, as a stream's
+                    # partial is): a scan skips it under any name, so it is
+                    # counted once, by this reservation, until released.
+                    reservation = self.reserve_new_file(kept_st.st_size, kept_st)
                     known = {}
                     for key in ("st_mode", "st_uid", "st_gid"):
                         value = getattr(newest, key, None)
                         known[key] = getattr(member_stat, key, None) if value is None else value
-                    private.append((kept, size, known))
+                    private.append((kept, reservation, known))
                 elif private is not None and read_denied:
                     self._fill_errno.code = errno.EACCES
                     raise OSError(errno.EACCES, f"the member withheld read of {source_virtual_path}",

@@ -1957,7 +1957,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 patch.object(self.backend, "stat", side_effect=probe_then_fail):
             data, session = self._stream_and_finish("mixed.bin", len(old))
             self.assertTrue(self._wait_for(lambda: self.fs._streaming_manager._streaming_stats.get(
-                "streaming_member_unconfirmed_discards") == 1, timeout=8.0))
+                "streaming_unconfirmed_discards") == 1, timeout=8.0))
         self.assertNotIn("streaming_member_changed_discards",
                          self.fs._streaming_manager._streaming_stats)
         self.assertNotEqual(data, new)  # it read from both versions
