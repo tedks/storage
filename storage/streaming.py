@@ -639,10 +639,8 @@ class StreamingReadManager:
     def cancel_download_session(self, selector: str):
         return self.cancel_download_session_with_reason(selector)[0]
 
-    def cancel_download_session_with_reason(self, selector: str):
-        """(outcome, reason): reason says why a busy download is busy
-        ("readers", "finalizing", or "stopping" for a failed or already
-        stopped download still being cleaned up), else None."""
+    def cancel_download_session_with_reason(self, selector: str) -> tuple[str, str | None]:
+        """Return the outcome and, for busy or cleanup-failed, the reason."""
         with self.prefetch_sessions_lock:
             for session in self.prefetch_sessions.values():
                 if session.session_id != selector:
@@ -653,11 +651,16 @@ class StreamingReadManager:
                     if self._download_terminal(session):
                         stopping = session.stop_requested or session.error is not None
                         return "busy", "stopping" if stopping else "finalizing"
-                    idle = self._stop_background_locked(session)
+                    idle, cleanup_error = self._stop_background_locked(session)
                 break
             else:
                 return "not-found", None
         self._complete_cancellation(session, idle)
+        if cleanup_error is not None:
+            detail = cleanup_error.strerror or str(cleanup_error)
+            return "cleanup-failed", (
+                f"could not remove partial cache file {str(session.partial_cache_path)!r}: {detail}"
+            )
         return "cancelled", None
 
     def destroy(self):
@@ -1365,8 +1368,8 @@ class StreamingReadManager:
         session.detached = True
         return True
 
-    def _unregister_and_unlink(self, session: PrefetchSession):
-        """Drop a just-claimed session from the registry and unlink its partial.
+    def _unregister_and_unlink(self, session: PrefetchSession) -> OSError | None:
+        """Drop a claimed session and return any error removing its partial.
 
         Caller holds prefetch_sessions_lock, which is what keeps a fresh
         session from installing its partial at the same path (the rename at
@@ -1384,15 +1387,18 @@ class StreamingReadManager:
         """
         if self.prefetch_sessions.get(session.canonical_path) is session:
             self.prefetch_sessions.pop(session.canonical_path, None)
+        cleanup_error = None
         try:
             session.partial_cache_path.unlink(missing_ok=True)
         except OSError as exc:
+            cleanup_error = exc
             # The next session for this path renames its own file over it
             # at registration; a mount restart sweeps it otherwise.
             self.logger.warning(
                 "streaming could not remove partial %s: %r", session.partial_cache_path, exc,
             )
         self.cache_manager.mark_cache_size_dirty()
+        return cleanup_error
 
     def _cleanup_prefetch_session(self, session: PrefetchSession, status: str):
         # Single-shot: release and the worker's tail can both reach cleanup
@@ -2255,7 +2261,8 @@ class StreamingReadManager:
                 # the scan is never stopped (see _claim_detach).
                 if not self._retained(victim):
                     continue
-                displaced.append((victim, self._stop_background_locked(victim)))
+                idle, _ = self._stop_background_locked(victim)
+                displaced.append((victim, idle))
             self._record_streaming_stat("streaming_retained_reader_cancellations")
 
     def _complete_displacements(self, displaced: list):
@@ -2318,7 +2325,8 @@ class StreamingReadManager:
                     for session in candidates:
                         with session.lock:
                             if self._retained(session):
-                                cancelled.append((session, self._stop_background_locked(session)))
+                                idle, _ = self._stop_background_locked(session)
+                                cancelled.append((session, idle))
                                 missing -= session.file_size
                                 if missing <= 0:
                                     break
@@ -2588,13 +2596,17 @@ class StreamingReadManager:
             and not session.readers_consumed
         )
 
-    def _stop_background_locked(self, session: PrefetchSession) -> bool:
-        """Unregister a stopped session. Caller holds the registry and session locks."""
+    def _stop_background_locked(self, session: PrefetchSession) -> tuple[bool, OSError | None]:
+        """Unregister a stopped session. Return whether its worker is idle and any unlink error.
+
+        Caller holds the registry and session locks.
+        """
         session.stop_requested = True
         session.condition.notify_all()
+        cleanup_error = None
         if self._claim_detach(session):
-            self._unregister_and_unlink(session)
-        return self._download_pool.cancel(session)
+            cleanup_error = self._unregister_and_unlink(session)
+        return self._download_pool.cancel(session), cleanup_error
 
     def _complete_cancellation(self, session: PrefetchSession, idle: bool):
         self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
@@ -2634,10 +2646,10 @@ class StreamingReadManager:
                     _, retained = self._download_session_counts()
                     if retained > self._download_limits["max_retained_streaming_sessions"]:
                         self._record_streaming_stat("streaming_retained_limit_cancellations")
-                        idle = self._stop_background_locked(session)
+                        idle, _ = self._stop_background_locked(session)
                         return "stopped" if idle else "stopped-in-flight"
                 if self._should_stop_on_last_close(session):
-                    idle = self._stop_background_locked(session)
+                    idle, _ = self._stop_background_locked(session)
                     return "stopped" if idle else "stopped-in-flight"
                 # Decided with the decrement, not after it: see worker_done.
                 if (session.error is not None and session.worker_done
@@ -2656,7 +2668,7 @@ class StreamingReadManager:
                         session.canonical_path, session.backend.name,
                     )
                     self._record_streaming_stat("streaming_unstaffed_cancellations")
-                    idle = self._stop_background_locked(session)
+                    idle, _ = self._stop_background_locked(session)
                     return "stopped" if idle else "stopped-in-flight"
                 return ""
 

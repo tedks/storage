@@ -10,7 +10,7 @@ import click
 from .control import (
     ControlError, REQUEST_TIMEOUT, canonical_mountpoint, open_cache_directory, request_control_payload,
 )
-from .mount_profiles import resolve_member_configuration
+from .mount_profiles import resolve_control_profile
 
 
 @dataclass(frozen=True)
@@ -28,9 +28,9 @@ class ControlTarget:
         if self.config_path is not None and not self.profile:
             raise click.UsageError("--config requires --profile")
         if self.profile:
-            resolved = resolve_member_configuration(self.profile, self.config_path, (), None, None)
+            cache, mountpoint = resolve_control_profile(self.profile, self.config_path)
             try:
-                return resolved.cache_root, canonical_mountpoint(resolved.mountpoint)
+                return cache, canonical_mountpoint(mountpoint)
             except ControlError as exc:
                 raise click.ClickException(str(exc)) from exc
         return self.cache.resolve(), None
@@ -213,6 +213,9 @@ def control_cancel(target, session_id):
     if not target.json_output:
         if outcome == "cancelled":
             click.echo(f"Cancelled download {session_id}")
+        elif outcome == "cleanup-failed":
+            reason = payload.get("reason") or "could not remove its partial cache file"
+            click.echo(f"Stopped download {session_id}, but {reason}", err=True)
         elif outcome == "busy":
             reason = BUSY_REASONS.get(payload.get("reason"), BUSY_REASONS[None])
             click.echo(f"Download {session_id} is busy: {reason}", err=True)

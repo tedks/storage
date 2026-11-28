@@ -244,6 +244,17 @@ class TestResolvedMountConfig(unittest.TestCase):
         self.assertIsNone(config.readdir_ttl)
         self.assertEqual(3600.0, config.listing_max_stale)
 
+    def test_mount_can_supply_members_for_an_identity_only_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "storage.toml"
+            profile.write_text('[mounts.test]\nmountpoint = "/mnt/test"\ncache = "/tmp/test-cache"\n')
+            resolved = self._resolve(mount_target="test", cache=None, config_path=profile)
+            self.assertEqual(("/srv/data",), resolved.member_specs)
+            self.assertEqual("/mnt/test", resolved.mountpoint)
+            self.assertEqual("/tmp/test-cache", resolved.cache)
+            with self.assertRaisesRegex(click.ClickException, "does not define any storage members"):
+                resolve_member_configuration("test", profile, (), None, None)
+
     def test_listing_max_stale_from_profile_and_validated(self):
         config_path = self._profile("listing_max_stale = 600\n")
         config = self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)

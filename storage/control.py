@@ -30,6 +30,11 @@ MAX_REQUEST_BYTES = 32 * 1024
 # Even if JSON escapes every path byte as six ASCII bytes, the list fits.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 REQUEST_TIMEOUT = 2.0
+_ACCEPT_RETRY_DELAY = 0.25
+_RETRY_ACCEPT_ERRORS = {
+    errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR, errno.ECONNABORTED,
+    errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM, errno.ETIMEDOUT,
+}
 # The reply to a request that arrives while the mount stops its socket.
 STOPPING_MESSAGE = "This mount is stopping; its control socket no longer serves requests"
 _PEER_CREDENTIALS = struct.Struct("iII")
@@ -609,30 +614,31 @@ class ControlServer:
         with self._lock:
             if self._listener is None:
                 return
-            self._stop.set()
-            try:
-                with _locked_fd(self._cache_fd) as root:
-                    self._withdraw(root)
-            except (OSError, ControlError):
-                # A replacement belongs to its publisher. A stale socket
-                # left by an interrupted cleanup can be taken over at start.
-                pass
-            self._listener.close()
-            self._listener = None
-            os.close(self._cache_fd)
-            self._cache_fd = None
-            self.cache_identity = None
-            self._owned_entry = None
-            timeout = REQUEST_TIMEOUT + 0.25
-            self._thread.join(timeout=timeout)
-            if self._thread.is_alive():
-                # Its listener is closed and its stop event set, so it exits
-                # after the request it is in; only that request is answered.
-                self._logger.warning(
-                    "control socket thread still in a request after %.2fs; it exits when that returns",
-                    timeout,
-                )
-            self._thread = None
+            thread = self._thread
+            self._retire_listener()
+        # The worker may be handling a fatal accept error and acquiring
+        # this same lock to retire its listener.
+        timeout = REQUEST_TIMEOUT + 0.25
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            self._logger.warning(
+                "control socket thread still in a request after %.2fs; it exits when that returns",
+                timeout,
+            )
+
+    def _retire_listener(self):
+        """Withdraw and close the current listener. Caller holds self._lock."""
+        self._stop.set()
+        try:
+            with _locked_fd(self._cache_fd) as root:
+                self._withdraw(root)
+        except (OSError, ControlError):
+            # Leave any replacement or stale socket for its owner or a later start.
+            pass
+        self._listener.close()
+        os.close(self._cache_fd)
+        self._listener = self._thread = self._cache_fd = None
+        self.cache_identity = self._owned_entry = None
 
     def _withdraw(self, root: int):
         """Remove our published socket, and only it.
@@ -675,9 +681,16 @@ class ControlServer:
         while not stop.is_set():
             try:
                 conn, _ = listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
+            except OSError as exc:
+                if isinstance(exc, socket.timeout) and exc.errno is None:
+                    continue  # The socket's normal timed wait already blocked.
+                if exc.errno in _RETRY_ACCEPT_ERRORS:
+                    stop.wait(_ACCEPT_RETRY_DELAY)
+                    continue
+                with self._lock:
+                    if self._listener is listener:
+                        self._logger.warning("control socket at %s stopped accepting: %s", self.path, exc)
+                        self._retire_listener()
                 return
             with conn:
                 self._serve_connection(conn, stop)

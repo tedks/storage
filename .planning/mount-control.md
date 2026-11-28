@@ -19,6 +19,7 @@ A mount owner can inspect live download activity, change limits without restarti
 - [x] (2026-11-28) Fixed the post-integration round (P1 to P5): replacement and withdrawal act only on an entry moved into a private stage and verified there, stages are proven by fd and an O_EXCL nonce and swept after a crash, profile matching follows a final mountpoint symlink, the mounted test reaps its reader and bounds its waits, and the response bounds are tested.
 - [x] (2026-11-28) Applied the e819934 dispositions. Stale-socket takeover uses atomic exchange and holds the probed inode until the decision is final. Withdrawal requires atomic no-replace rename. Stages left by a crash are kept for manual recovery. Mountpoint parents are checked by a kernel directory lookup.
 - [x] (2026-11-28) Start the control thread before publication and skip control stages during startup partial cleanup. Preserve stages with uncertain ownership and log the actual recovery location of displaced entries.
+- [x] (2026-11-28) Address the formal findings on 4596588. Retry temporary accept failures and retire a permanently failed listener. Resolve control profiles from their mountpoint and cache fields. Report a stopped download whose partial could not be removed as `cleanup-failed`.
 - [ ] Run the full gate (`scripts/run-gates.sh`) on the exact head before merge. That result, and the revision it covers, is recorded on PR #186, not here.
 
 ## Surprises & Discoveries

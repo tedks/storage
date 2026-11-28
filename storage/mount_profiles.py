@@ -490,6 +490,39 @@ def create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], k
     return create_storage_members(tuple(backing_paths) + tuple(remote_specs), key_file)
 
 
+def _find_mount_profile(
+    profile_name: str, config_path: Optional[Path],
+) -> Tuple[Path, Dict[str, Any]]:
+    if config_path is not None:
+        return config_path, _load_mount_profile(config_path, profile_name)
+
+    defaults = default_mount_config_paths()
+    available_configs = [candidate for candidate in defaults if candidate.exists()]
+    if not available_configs:
+        searched = ", ".join(str(path) for path in defaults)
+        raise click.ClickException(
+            f"No default mount config files found while looking for profile '{profile_name}': {searched}"
+        )
+    for candidate in available_configs:
+        try:
+            return candidate, _load_mount_profile(candidate, profile_name)
+        except click.ClickException as exc:
+            if f"Mount profile '{profile_name}' not found" not in str(exc):
+                raise
+    searched = ", ".join(str(path) for path in available_configs)
+    raise click.ClickException(
+        f"Mount profile '{profile_name}' not found in default config files: {searched}"
+    )
+
+
+def resolve_control_profile(profile_name: str, config_path: Optional[Path]) -> Tuple[Path, str]:
+    """Resolve the two profile fields that identify a control endpoint."""
+    _, profile = _find_mount_profile(profile_name, config_path)
+    mountpoint = _require_profile_string(profile, "mountpoint", profile_name)
+    cache = _require_profile_string(profile, "cache", profile_name)
+    return Path(cache).resolve(), mountpoint
+
+
 def resolve_member_configuration(
     profile_name: Optional[str],
     config_path: Optional[Path],
@@ -503,31 +536,8 @@ def resolve_member_configuration(
                 "Provide either a mount profile or explicit --member options, not both."
             )
 
-        profile_source = config_path
-        if profile_source is None:
-            available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
-            if not available_configs:
-                searched = ", ".join(str(path) for path in default_mount_config_paths())
-                raise click.ClickException(
-                    f"No default mount config files found while looking for profile '{profile_name}': {searched}"
-                )
-
-            for candidate in available_configs:
-                try:
-                    settings = _load_mount_profile_settings(candidate, profile_name)
-                    profile_source = candidate
-                    break
-                except click.ClickException as exc:
-                    if f"Mount profile '{profile_name}' not found" in str(exc):
-                        continue
-                    raise
-            else:
-                searched = ", ".join(str(path) for path in available_configs)
-                raise click.ClickException(
-                    f"Mount profile '{profile_name}' not found in default config files: {searched}"
-                )
-        else:
-            settings = _load_mount_profile_settings(profile_source, profile_name)
+        profile_source, profile = _find_mount_profile(profile_name, config_path)
+        settings = _mount_profile_settings(profile, profile_name)
 
         resolved_specs = settings["backing_paths"] + settings["remote"]
         if not resolved_specs:
@@ -569,7 +579,10 @@ def resolve_member_configuration(
 
 
 def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[str, Any]:
-    config_profile = _load_mount_profile(config_path, profile_name)
+    return _mount_profile_settings(_load_mount_profile(config_path, profile_name), profile_name)
+
+
+def _mount_profile_settings(config_profile: Dict[str, Any], profile_name: str) -> Dict[str, Any]:
     entries = _profile_backends(config_profile, profile_name)
     local_entries = [(spec, label) for spec, label in entries if not spec.startswith(("ssh://", "rsync://"))]
     remote_entries = [(spec, label) for spec, label in entries if spec.startswith(("ssh://", "rsync://"))]

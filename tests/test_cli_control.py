@@ -453,15 +453,17 @@ def test_never_replaces_arbitrary_entries(cache):
     assert path.read_text() == "another publisher"
 
 
-def write_profile(cache, mountpoint="/never-mounted"):
+def write_profile(cache, mountpoint="/never-mounted", *, with_members=True):
     config = cache / "storage.toml"
     # TOML has no surrogate escapes, so write non-ASCII paths as UTF-8.
-    config.write_text(f"""
+    contents = f"""
 [mounts.example]
 mountpoint = {json.dumps(str(mountpoint), ensure_ascii=False)}
 cache = {json.dumps(str(cache))}
-backends = ["/no-member-probe"]
-""", encoding="utf-8")
+"""
+    if with_members:
+        contents += 'backends = ["/no-member-probe"]\n'
+    config.write_text(contents, encoding="utf-8")
     return config
 
 
@@ -485,13 +487,20 @@ def recording_server(cache, mountpoint, reported_cache=None):
     return server_for(cache, dispatch), requests
 
 
-def test_profile_selection_and_atomic_set_request(cache):
-    config = write_profile(cache)
+@pytest.mark.parametrize("explicit_config", [True, False])
+def test_profile_selection_and_atomic_set_request(cache, explicit_config, monkeypatch):
+    config = write_profile(cache, with_members=False)
+    if not explicit_config:
+        earlier = cache / "earlier.toml"
+        earlier.write_text("[mounts.other]\n")
+        monkeypatch.setattr("storage.mount_profiles.default_mount_config_paths", lambda: (earlier, config))
     server, requests = recording_server(cache, "/never-mounted")
     server.start()
     try:
         runner = CliRunner()
-        options = ["control", "--profile", "example", "--config", str(config), "--json-output"]
+        options = ["control", "--profile", "example", "--json-output"]
+        if explicit_config:
+            options += ["--config", str(config)]
         result = runner.invoke(main, options)
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["ok"] is True
@@ -723,6 +732,31 @@ def test_cancel_outcomes_have_distinct_exit_codes(cache, outcome, code):
             result = CliRunner().invoke(main, ["control", "--cache", str(cache), *json_output,
                                                "cancel", "0" * 32])
             assert result.exit_code == code, result.output
+    finally:
+        server.stop()
+
+
+def test_cancel_cleanup_failure_has_an_error_exit_and_recovery_detail(cache):
+    session_id = "0" * 32
+    reason = "could not remove partial cache file '/cache/film.storage.partial': Permission denied"
+    response = {"id": session_id, "result": "cleanup-failed", "reason": reason}
+
+    def dispatch(frame):
+        if json.loads(frame)["command"] == "status":
+            return full_status(cache, None)
+        return response
+
+    server = server_for(cache, dispatch)
+    server.start()
+    try:
+        runner = CliRunner()
+        options = ["control", "--cache", str(cache)]
+        outcome = runner.invoke(main, options + ["cancel", session_id])
+        assert outcome.exit_code == 1
+        assert outcome.stderr.strip() == f"Stopped download {session_id}, but {reason}"
+        outcome = runner.invoke(main, options + ["--json-output", "cancel", session_id])
+        assert outcome.exit_code == 1
+        assert json.loads(outcome.output) == response
     finally:
         server.stop()
 
@@ -997,6 +1031,90 @@ def test_publication_failure_releases_the_waiting_thread(cache, monkeypatch):
     assert worker_exited.is_set()
     assert not server._listener
     assert list(cache.iterdir()) == []
+
+
+def test_transient_accept_errors_recover_on_the_same_listener(cache, monkeypatch):
+    errors = iter((errno.EMFILE, errno.ENFILE))
+    accept = socket.socket.accept
+
+    def temporarily_unavailable(listener):
+        error = next(errors, None)
+        if error is not None:
+            raise OSError(error, os.strerror(error))
+        return accept(listener)
+
+    monkeypatch.setattr(socket.socket, "accept", temporarily_unavailable)
+    server = server_for(cache, lambda _: {"served": True})
+    server.start()
+    listener = server._listener
+    try:
+        assert request_control_payload(cache, b"status", 3) == {"served": True}
+        assert server._listener is listener
+    finally:
+        server.stop()
+
+
+def test_stop_interrupts_accept_backoff(cache, monkeypatch):
+    paused = threading.Event()
+    server = server_for(cache, lambda _: {})
+
+    def exhausted(listener):
+        if not paused.is_set():
+            stop = server._stop
+            wait = stop.wait
+
+            def record_wait(delay):
+                assert delay == 30
+                paused.set()
+                return wait(delay)
+
+            monkeypatch.setattr(stop, "wait", record_wait)
+        raise OSError(errno.EMFILE, "test descriptor limit")
+
+    monkeypatch.setattr(control_module, "_ACCEPT_RETRY_DELAY", 30)
+    monkeypatch.setattr(socket.socket, "accept", exhausted)
+    server.start()
+    thread = server._thread
+    try:
+        assert paused.wait(3)
+    finally:
+        server.stop()
+    assert not thread.is_alive()
+    assert list(cache.iterdir()) == []
+
+
+def test_fatal_accept_error_retires_the_listener_and_allows_restart(cache, monkeypatch, caplog):
+    entered = threading.Event()
+    fail = threading.Event()
+    accept = socket.socket.accept
+
+    def fail_once(listener):
+        if not entered.is_set():
+            entered.set()
+            assert fail.wait(5)
+            raise OSError(errno.EBADF, "test fatal accept error")
+        return accept(listener)
+
+    monkeypatch.setattr(socket.socket, "accept", fail_once)
+    server = server_for(cache, lambda _: {"restarted": True})
+    server.start()
+    thread, listener = server._thread, server._listener
+    try:
+        assert entered.wait(3)
+        fail.set()
+        thread.join(3)
+        assert not thread.is_alive()
+        assert listener.fileno() == -1
+        assert server._listener is None and server._thread is None
+        assert server._cache_fd is None and server.cache_identity is None
+        assert list(cache.iterdir()) == []
+        assert "test fatal accept error" in caplog.text
+
+        server.start()
+        assert request_control_payload(cache, b"status", 3) == {"restarted": True}
+    finally:
+        fail.set()
+        server.stop()
 
 
 class _StageSwappingSocket(socket.socket):

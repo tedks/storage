@@ -763,6 +763,42 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.backend.worker_gate.set()
         self.assertTrue(retained.background_finished.wait(timeout=3))
 
+    def test_cancel_reports_a_partial_unlink_failure_after_detaching(self):
+        manager = self.fs._streaming_manager
+        self.backend.worker_gate = threading.Event()
+        session = self._open_retained_fill("retained.bin", b"x" * (384 * 1024))
+        partial = session.partial_cache_path
+        unlink = Path.unlink
+
+        def fail_unlink(path, *args, **kwargs):
+            if path == partial:
+                raise PermissionError(errno.EACCES, "Permission denied", path)
+            return unlink(path, *args, **kwargs)
+
+        command = json.dumps({"command": "downloads.cancel", "id": session.session_id})
+        with patch.object(Path, "unlink", fail_unlink), self.assertLogs(manager.logger, "WARNING") as logged:
+            outcome = manager._handle_control_request(command)
+
+        self.assertEqual(outcome, {
+            "id": session.session_id,
+            "result": "cleanup-failed",
+            "reason": f"could not remove partial cache file {str(partial)!r}: Permission denied",
+        })
+        self.assertIn(str(partial), "\n".join(logged.output))
+        self.assertTrue(session.detached)
+        self.assertTrue(session.stop_requested)
+        self.assertEqual(manager.list_download_sessions(), [])
+        self.assertEqual(manager._handle_control_request(command), {
+            "id": session.session_id, "result": "not-found",
+        })
+        self.backend.worker_gate.set()
+        self.assertTrue(session.background_finished.wait(timeout=3))
+        self.assertTrue(partial.exists())
+        self.assertFalse((self.cache_dir / "retained.bin").exists())
+
+        self._remake_fs()
+        self.assertFalse(partial.exists())
+
     def test_space_reclaim_stops_the_retained_fill_with_fewest_bytes_first(self):
         self.fs.cache_manager.max_size_bytes = 1024 * 1024
         self.backend.worker_gate = threading.Event()

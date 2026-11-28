@@ -567,7 +567,8 @@ storage info PATH
 
 Inspect and tune a running mount as the user who started it. Use the mount's
 cache directory or a profile name. Profile selection reads the configured
-cache path. Use `--cache` when the running mount was started with a cache
+cache path and mountpoint. It also works for profiles whose storage members
+were supplied on the mount command line. Use `--cache` when the mount used a cache
 override or the profile now points to a different cache.
 
 Two mounts configured with the same cache share one control socket, and only
@@ -624,8 +625,12 @@ abandoned the download, including its partial cache file. A download with a
 reader, in finalization, or still cleaning up after a failure or an earlier
 cancel reports `busy` and says which (`reason` in the JSON: `readers`,
 `finalizing` or `stopping`). Close its readers, or wait, before retrying. A vanished ID reports `not-found`, including when a new
-download has started for the same path. `busy` exits with status 3 and
-`not-found` with status 4; other errors exit with 1, usage errors with 2.
+download has started for the same path. If the mount stops the download but
+cannot remove its partial, it reports `cleanup-failed` and gives the path and
+error. The ID is retired. After the filesystem error is resolved, a new
+download can replace the partial or the next mount startup can remove it.
+`busy` exits with status 3, `not-found` with 4, and `cleanup-failed` and
+other errors with 1. Usage errors exit with 2.
 The endpoint is the private `.storage.control.sock` in the mount cache.
 The mount publishes it only when the cache directory is owned by the mount's
 user and is not writable by all users unless sticky (group write, as under umask
@@ -642,7 +647,8 @@ shared writable cache, Storage keeps the entry in the stage and logs its
 location. Without exchange support, startup leaves an occupied name in
 place and logs a warning. Without no-replace rename support, shutdown
 leaves its dead socket in place. Failure to start the control thread leaves
-the mount running without a control socket.
+the mount running without a control socket. Temporary accept errors are
+retried with a delay, and a fatal accept error retires the endpoint.
 
 An interrupted operation can leave a staging directory behind. A cache
 writable by other users can also retain empty stages after normal
