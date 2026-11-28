@@ -979,6 +979,26 @@ def test_restart_while_a_stopped_thread_is_still_in_a_request(cache, monkeypatch
     assert not (cache / CONTROL_SOCKET_NAME).exists()
 
 
+def test_publication_failure_releases_the_waiting_thread(cache, monkeypatch):
+    server = server_for(cache, lambda _: {})
+    worker_exited = threading.Event()
+    serve = server._serve
+
+    def record_exit(*args):
+        serve(*args)
+        worker_exited.set()
+
+    def fail_publication(listener):
+        raise OSError(errno.EIO, "injected publication failure")
+
+    monkeypatch.setattr(server, "_serve", record_exit)
+    monkeypatch.setattr(server, "_publish", fail_publication)
+    server.start()
+    assert worker_exited.is_set()
+    assert not server._listener
+    assert list(cache.iterdir()) == []
+
+
 class _StageSwappingSocket(socket.socket):
     """Renames the stage away at bind and leaves a symlink to `outside` in its place."""
 
@@ -1063,12 +1083,13 @@ def test_directory_substituted_for_the_new_stage_is_left_alone(cache, monkeypatc
 
 def test_empty_private_directory_substituted_for_the_stage(cache, monkeypatch):
     # Indistinguishable from the stage mkdir made: it is used, gets only our
-    # nonce and socket, and those are all that is removed from it (then the
-    # empty directory itself, which its mover could rmdir anyway).
+    # nonce and socket. With a shared parent its provenance is ambiguous,
+    # so only the entries the server made are removed.
     cache.chmod(0o775)
     victim = cache / "victim"
     victim.mkdir(0o700)
     victim.chmod(0o700)
+    identity = victim.stat().st_ino
     server = server_for(cache, lambda _: {"published": True})
     replaced = substitute_on_mkdir(monkeypatch, cache, victim)
     server.start()
@@ -1076,11 +1097,12 @@ def test_empty_private_directory_substituted_for_the_stage(cache, monkeypatch):
     try:
         assert request_control_payload(cache, b"status", 2) == {"published": True}
         substituted, = replaced
-        assert not substituted.exists()
+        assert substituted.stat().st_ino == identity
+        assert list(substituted.iterdir()) == []
         # Our own mkdir'd directory, moved away, is not removed: it cannot be
         # told from anyone else's.
         assert (cache / "ours, moved away").is_dir()
-        assert sorted(os.listdir(cache)) == sorted([CONTROL_SOCKET_NAME, "ours, moved away"])
+        assert set(os.listdir(cache)) == {CONTROL_SOCKET_NAME, "ours, moved away", substituted.name}
     finally:
         server.stop()
         cache.chmod(0o700)
@@ -1381,8 +1403,30 @@ def test_a_failed_exchange_rollback_keeps_the_displaced_entry(cache, monkeypatch
             server._publish(listener)
     stage, = cache.iterdir()
     assert (stage / control_module.STAGE_SOCKET).read_text() == "displaced entry"
-    assert "could not undo the control socket exchange" in caplog.text
+    assert "could not restore the displaced entry" in caplog.text
     assert str(stage) in caplog.text
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o770])
+@pytest.mark.parametrize("name", [control_module.STAGE_SOCKET, control_module.STAGE_MOVED])
+def test_restore_keeps_the_public_entry_and_reports_the_actual_stage(cache, caplog, mode, name):
+    cache.chmod(mode)
+    path = cache / CONTROL_SOCKET_NAME
+    path.write_text("public")
+    server = server_for(cache, lambda _: {})
+    with control_module._locked_cache(cache) as root:
+        stage = control_module._Stage(root)
+        try:
+            actual = cache / f"{control_module.STAGE_PREFIX}recovery"
+            (cache / stage.name).rename(actual)
+            displaced = actual / name
+            displaced.write_text("displaced")
+            server._restore(stage, root, name)
+        finally:
+            stage.remove()
+    assert path.read_text() == "public"
+    assert displaced.read_text() == "displaced"
+    assert f"retained at {str(displaced)!r}" in caplog.text
 
 
 _CRASH_AFTER_EXCHANGE = r"""
@@ -1556,16 +1600,20 @@ def test_refuses_a_world_writable_cache(cache, mode, caplog):
 @pytest.mark.parametrize("mode", [0o700, 0o755, 0o775, 0o770, 0o720, 0o1777, 0o1770])
 def test_publishes_in_an_owned_cache_not_world_writable(cache, mode):
     cache.chmod(mode)
+    shared_write = bool(mode & 0o022)
     server = server_for(cache, lambda _: {"mode": mode})
     server.start()
     try:
         assert request_control_payload(cache, b"status", 2) == {"mode": mode}
-        # Only the socket: the stage directory is gone.
-        assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+        stages = [entry for entry in cache.iterdir() if entry.name != CONTROL_SOCKET_NAME]
+        assert len(stages) == int(shared_write)
+        assert all(entry.is_dir() and list(entry.iterdir()) == [] for entry in stages)
     finally:
         server.stop()
         cache.chmod(0o700)
-    assert sorted(os.listdir(cache)) == []
+    stages = list(cache.iterdir())
+    assert len(stages) == 2 * int(shared_write)
+    assert all(entry.is_dir() and list(entry.iterdir()) == [] for entry in stages)
 
 
 def test_refuses_a_cache_owned_by_another_user(cache, monkeypatch, caplog):

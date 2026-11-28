@@ -20,7 +20,7 @@ from storage.backends.base import (
 from storage.backends.local import LocalBackend
 from storage.backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
-from storage.control import ControlError
+from storage.control import CONTROL_SOCKET_NAME, STAGE_PREFIX, ControlError, request_control_payload
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.streaming import (
@@ -119,6 +119,49 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 return True
             time.sleep(0.05)
         return predicate()
+
+    def test_startup_preserves_partials_in_control_recovery_stages(self):
+        stale = self.cache_dir / "ordinary" / "fetch.storage.partial"
+        stale.parent.mkdir()
+        stale.write_bytes(b"stale")
+        retained = []
+        for digits in (16, 32):
+            displaced = self.cache_dir / (STAGE_PREFIX + "a" * digits) / "moved" / "nested"
+            displaced.mkdir(parents=True)
+            partial = displaced / "file.storage.partial"
+            partial.write_bytes(b"recovery data")
+            retained.append(partial)
+
+        self._remake_fs()
+
+        self.assertFalse(stale.exists())
+        for partial in retained:
+            self.assertEqual(partial.read_bytes(), b"recovery data")
+
+    def test_mount_init_continues_when_the_control_thread_cannot_start(self):
+        server = self.fs._streaming_manager._control_server
+        start_thread = threading.Thread.start
+
+        def reject_control_thread(thread):
+            if thread.name == "storage-control-socket":
+                raise RuntimeError("cannot start test control thread")
+            start_thread(thread)
+
+        with patch.object(threading.Thread, "start", reject_control_thread), \
+                patch.object(self.fs.sync_manager, "start") as start_sync, \
+                self.assertLogs(server._logger, "WARNING") as logged:
+            self.fs.init("/")
+        start_sync.assert_called_once_with()
+        self.assertIn("cannot start test control thread", "\n".join(logged.output))
+        self.assertFalse((self.cache_dir / CONTROL_SOCKET_NAME).exists())
+        self.assertIsNone(server._listener)
+        self.assertIsNone(server._thread)
+        self.assertIsNone(server._cache_fd)
+        self.assertIsNone(server.cache_identity)
+
+        server.start()
+        status = request_control_payload(self.cache_dir, b'{"command":"status"}', 2)
+        self.assertEqual(tuple(status["mount"]["cache"]), server.cache_identity)
 
     def test_download_workers_grow_for_runnable_files_and_retire_when_idle(self):
         manager = self.fs._streaming_manager

@@ -21,7 +21,7 @@ from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
-from .control import STOPPING_MESSAGE, ControlError, ControlServer, canonical_mountpoint
+from .control import STAGE_PREFIX, STOPPING_MESSAGE, ControlError, ControlServer, canonical_mountpoint
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -721,16 +721,19 @@ class StreamingReadManager:
         """Delete stale partial-cache files left by prior crashes.
 
         Startup only (StorageFS.__init__, before the mount serves anything):
-        it removes every name ending in the partial suffix, including a live
-        session's partial or staging file.
+        it removes partials and staging files. Control stages can hold
+        displaced entries for manual recovery, so skip those subtrees.
         """
         removed = 0
-        for partial_path in self.cache_manager.cache_root.rglob(f"*{self.partial_suffix}"):
-            try:
-                partial_path.unlink()
-                removed += 1
-            except OSError:
-                continue
+        for root, dirs, files in os.walk(self.cache_manager.cache_root):
+            dirs[:] = [name for name in dirs if not name.startswith(STAGE_PREFIX)]
+            for name in (*files, *dirs):
+                if name.endswith(self.partial_suffix):
+                    try:
+                        os.unlink(os.path.join(root, name))
+                        removed += 1
+                    except OSError:
+                        continue
         if removed:
             self.cache_manager.mark_cache_size_dirty()
             self.logger.info("Removed %d stale partial cache files", removed)

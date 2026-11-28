@@ -13,7 +13,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from .backends.local import NOREPLACE_UNSUPPORTED, RENAME_EXCHANGE, RENAME_NOREPLACE, renameat2
@@ -285,9 +285,9 @@ def _entry_at(dir_fd: int, name: str) -> os.stat_result:
     return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
 
 
-# Publication and cleanup stage in a private directory of the cache, named
-# STAGE_PREFIX plus a 32-hex-digit nonce, and exist only while the cache lock
-# is held. A stage holds at most STAGE_NONCE (a file made O_EXCL holding
+# Publication and cleanup use a private directory of the cache, named
+# STAGE_PREFIX plus a 32-hex-digit nonce. A stage holds at most
+# STAGE_NONCE (a file made O_EXCL holding
 # the nonce), STAGE_SOCKET (the socket being published or the entry
 # displaced at takeover), and STAGE_MOVED (the entry moved at stop).
 # Cache walkers skip the prefix. README describes manual crash recovery.
@@ -364,26 +364,23 @@ def _pin_entry(dir_fd: int, name: str) -> int:
 
 
 class _Stage:
-    """A private directory in the cache that this process created and uses.
+    """A private directory used while the cache lock is held.
 
     mkdir(0o700) at a random name, then open it O_NOFOLLOW through the
     cache fd and require a directory we own, with no group or other bits,
     owner rwx and no entries; nothing touches it before that, and it is
     never chmodded. A nonce file holding the nonce in the stage's name is
     made in it O_EXCL as a recovery aid. Cleanup removes only
-    entries whose identity this process recorded when it made them, then
-    the directory if it is empty and its name still names it.
-
-    A group writer of the cache could swap in, between mkdir and open, an
-    empty 0700 directory of the mount user's from elsewhere in the cache.
-    That passes the check: it then gets our nonce and socket, which are
-    removed, and is itself removed by the final rmdir. That grants nothing:
-    whoever can rename an empty directory between two directories they can
-    write can rmdir it there too. Anything else in it is never removed.
+    entries whose identity this process recorded when it made them. Only
+    an owner-writable parent allows trusting that the directory we opened
+    is the one we created and still owns its name at rmdir time.
     """
 
     def __init__(self, root_fd: int):
         self.root_fd = root_fd
+        entry = os.fstat(root_fd)
+        self.private_parent = (entry.st_uid == os.geteuid()
+                               and not entry.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
         nonce_text = secrets.token_hex(16)
         self.name = f"{STAGE_PREFIX}{nonce_text}"
         self.created: dict[str, tuple[int, int]] = {}
@@ -420,9 +417,16 @@ class _Stage:
         except OSError:
             return False
 
+    def recovery_location(self, name: str) -> str:
+        # The stage or its parent can have been renamed while its fd is held.
+        try:
+            return repr(os.path.join(os.readlink(f"/proc/self/fd/{self.fd}"), name))
+        except OSError:
+            dev, inode = self.identity
+            return f"{name!r} in stage inode {inode} on device {dev} (path unavailable)"
+
     def remove(self):
-        """Best effort: what we made, then the directory if it is empty and
-        its name still names it. Anything else is left, and so the stage."""
+        """Remove the entries we made and, when ownership is clear, the directory."""
         try:
             for name, identity in self.created.items():
                 try:
@@ -431,7 +435,7 @@ class _Stage:
                 except OSError:
                     pass
             try:
-                if not os.listdir(self.fd) and self.still_named():
+                if self.private_parent and not os.listdir(self.fd) and self.still_named():
                     os.rmdir(self.name, dir_fd=self.root_fd)
             except OSError:
                 pass
@@ -459,8 +463,8 @@ class ControlServer:
         # directory the socket was published in even if the path moved.
         self._cache_fd = None
 
-    def _publish(self, listener: socket.socket) -> tuple[tuple[int, int], int]:
-        """Publish the listener; return the socket's identity and a new cache fd.
+    def _publish(self, listener: socket.socket) -> tuple[tuple[int, int], int, tuple[int, int]]:
+        """Publish the listener and return its identity, the cache fd and cache identity.
 
         The cache fd is a separate open of the locked directory, so holding
         it does not hold the lock. The caller owns it.
@@ -471,7 +475,8 @@ class ControlServer:
             _require_private_cache(root)
             pinned = os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=root)
             try:
-                return self._publish_in(listener, root), pinned
+                cache_identity = _identity(os.fstat(pinned))
+                return self._publish_in(listener, root), pinned, cache_identity
             except BaseException:
                 os.close(pinned)
                 raise
@@ -515,8 +520,8 @@ class ControlServer:
         into the stage. If the process dies after the exchange, our dead
         socket is public and the displaced entry is available for recovery.
         If the stage side cannot be verified as the pinned inode and
-        removed, try to undo the exchange. Without RENAME_EXCHANGE an
-        occupied name is left in place.
+        removed, try to restore it without displacing another entry.
+        Without RENAME_EXCHANGE an occupied name is left in place.
         """
         try:
             pin = _pin_entry(root, CONTROL_SOCKET_NAME)
@@ -544,33 +549,28 @@ class ControlServer:
                     raise ControlError("control socket changed during startup")
                 os.unlink(STAGE_SOCKET, dir_fd=stage.fd)
             except BaseException:
-                try:
-                    restored = _rename(stage.fd, STAGE_SOCKET, root, CONTROL_SOCKET_NAME,
-                                       RENAME_EXCHANGE)
-                except OSError as exc:
-                    restored = exc
-                if restored is not True:
-                    self._logger.warning(
-                        "could not undo the control socket exchange at %s; the displaced "
-                        "entry was left in %s (%s)", self.path, self.path.parent / stage.name,
-                        restored,
-                    )
+                self._restore(stage, root, STAGE_SOCKET)
                 raise
         finally:
             os.close(pin)
 
-    def _put_back(self, stage: _Stage, root: int):
-        # Never raises: it runs while another error is on its way out.
+    def _restore(self, stage: _Stage, root: int, name: str):
+        # In a shared parent the public entry can change between the
+        # identity check and rename. Only restore into a free name there.
         try:
-            restored = _rename(stage.fd, STAGE_MOVED, root, CONTROL_SOCKET_NAME, RENAME_NOREPLACE)
+            flags = RENAME_NOREPLACE
+            if name == STAGE_SOCKET and stage.private_parent:
+                with suppress(FileNotFoundError):
+                    public = _entry_at(root, CONTROL_SOCKET_NAME)
+                    if _identity(public) == stage.created.get(STAGE_SOCKET):
+                        flags = RENAME_EXCHANGE
+            restored = _rename(stage.fd, name, root, CONTROL_SOCKET_NAME, flags)
         except OSError as exc:
             restored = exc
         if restored is not True:
-            # A newer entry took the name, or the restore failed; keep
-            # both. The moved one stays in the stage, which is then left.
             self._logger.warning(
-                "could not restore the displaced entry %s from %s (%s)",
-                self.path, self.path.parent / stage.name, restored,
+                "could not restore the displaced entry at %s; retained at %s (%s)",
+                self.path, stage.recovery_location(name), restored,
             )
 
     def start(self):
@@ -578,27 +578,32 @@ class ControlServer:
             if self._listener is not None:
                 return
             listener = None
+            thread = None
+            ready = threading.Event()
+            stop = threading.Event()
             try:
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self._owned_entry, self._cache_fd = self._publish(listener)
-                self.cache_identity = _identity(os.fstat(self._cache_fd))
-            except (OSError, ControlError) as exc:
-                if listener is not None:
-                    listener.close()
-                if self._cache_fd is not None:
-                    os.close(self._cache_fd)
-                    self._cache_fd = None
+                # A failed thread launch should leave no public endpoint.
+                # A launched thread waits until the mount identity is set.
+                thread = threading.Thread(
+                    target=self._serve, args=(listener, stop, ready), daemon=True,
+                    name="storage-control-socket",
+                )
+                thread.start()
+                self._owned_entry, self._cache_fd, self.cache_identity = self._publish(listener)
+                self._listener, self._thread, self._stop = listener, thread, stop
+            except (OSError, ControlError, RuntimeError) as exc:
                 self._logger.warning("failed to start control socket at %s: %s", self.path, exc)
-                return
-            # Each listener gets its own stop event, so a thread that outlived
-            # an earlier stop() still sees its own stop and never serves again.
-            self._stop = threading.Event()
-            self._listener = listener
-            self._thread = threading.Thread(
-                target=self._serve, args=(listener, self._stop), daemon=True,
-                name="storage-control-socket",
-            )
-            self._thread.start()
+            finally:
+                failed = self._listener is None
+                if failed:
+                    stop.set()
+                ready.set()
+                if failed:
+                    if listener is not None:
+                        listener.close()
+                    if thread is not None and thread.ident is not None:
+                        thread.join()
 
     def stop(self):
         with self._lock:
@@ -617,6 +622,7 @@ class ControlServer:
             os.close(self._cache_fd)
             self._cache_fd = None
             self.cache_identity = None
+            self._owned_entry = None
             timeout = REQUEST_TIMEOUT + 0.25
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
@@ -656,7 +662,7 @@ class ControlServer:
                         raise ControlError("control socket changed during stop")
                     os.unlink(STAGE_MOVED, dir_fd=stage.fd)
                 except BaseException as exc:
-                    self._put_back(stage, root)
+                    self._restore(stage, root, STAGE_MOVED)
                     if not isinstance(exc, ControlError):
                         raise
             finally:
@@ -664,7 +670,8 @@ class ControlServer:
         finally:
             os.close(pin)
 
-    def _serve(self, listener: socket.socket, stop: threading.Event):
+    def _serve(self, listener: socket.socket, stop: threading.Event, ready: threading.Event):
+        ready.wait()
         while not stop.is_set():
             try:
                 conn, _ = listener.accept()
