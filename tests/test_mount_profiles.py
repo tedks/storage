@@ -258,6 +258,17 @@ class TestResolvedMountConfig(unittest.TestCase):
             with self.subTest(value=bad), self.assertRaises(click.ClickException):
                 self._resolve(readdir_ttl=bad)
 
+    def test_download_limits_out_of_range_are_rejected(self):
+        for overrides in ({"max_streaming_sessions": 0}, {"max_download_workers": 33},
+                          {"max_retained_streaming_sessions": -1}, {"max_download_workers": True}):
+            with self.subTest(**overrides), self.assertRaises(click.ClickException):
+                self._resolve(**overrides)
+        for body in ("max_streaming_sessions = 0\n", "max_download_workers = 33\n",
+                     "max_retained_streaming_sessions = -1\n", "max_download_workers = true\n"):
+            config_path = self._profile(body)
+            with self.subTest(profile=body), self.assertRaises(click.ClickException):
+                self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
+
     def test_enable_watchers_defaults_to_false(self):
         config = self._resolve()
         self.assertFalse(config.enable_watchers)

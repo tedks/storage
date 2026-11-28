@@ -20,7 +20,9 @@ from storage.backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
-from storage.streaming import ACTIVE_DOWNLOAD_BURST, PrefetchSession, _DownloadPool
+from storage.streaming import (
+    ACTIVE_DOWNLOAD_BURST, PrefetchSession, _DownloadPool, validate_download_limits,
+)
 from storage.mount_profiles import parse_keep_after_close
 
 
@@ -1179,6 +1181,35 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(retained.io_fd, -1)
         self.assertEqual(manager.list_download_sessions(), [])
         self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot()[1:] == (0, 0)))
+
+    INVALID_DOWNLOAD_LIMITS = (
+        {"max_streaming_sessions": 0},
+        {"max_streaming_sessions": 1025},
+        {"max_download_workers": 0},
+        {"max_download_workers": 33},
+        {"max_retained_streaming_sessions": -1},
+        {"max_retained_streaming_sessions": 1025},
+        {"max_download_workers": True},
+        {"max_streaming_sessions": 2.0},
+        {"max_streaming_sessions": "2"},
+        {"max_streaming_sessions": None},
+        {"max_parallel_downloads": 2},
+    )
+
+    def test_invalid_download_limits_are_rejected(self):
+        manager = self.fs._streaming_manager
+        before = manager.download_limits()
+        for limits in self.INVALID_DOWNLOAD_LIMITS:
+            with self.subTest(limits=limits):
+                with self.assertRaises(ValueError):
+                    validate_download_limits(limits)
+                with self.assertRaises(ValueError):
+                    manager.update_download_limits(**limits)
+                self.assertEqual(manager.download_limits(), before)
+        for limits in ({"max_streaming_sessions": 1}, {"max_retained_streaming_sessions": 0},
+                       {"max_download_workers": 32}):
+            with self.subTest(limits=limits):
+                validate_download_limits(limits)
 
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
