@@ -156,10 +156,20 @@ def _locked_cache(cache_root: Path):
     """
     fd = os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield fd
+        with _locked_fd(fd):
+            yield fd
     finally:
         os.close(fd)
+
+
+@contextmanager
+def _locked_fd(fd: int):
+    # The same non-blocking cache lock, on an fd already open.
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        yield fd
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 def _require_private_cache(root_fd: int):
@@ -232,9 +242,14 @@ class ControlServer:
         self._listener = None
         self._owned_entry = None
         # (st_dev, st_ino) of the cache directory the socket was published
-        # in, from its locked fd. A socket moved into another cache still
-        # reports this one, so clients can tell. None until published.
+        # in. A socket moved into another cache still reports this one, so
+        # clients can tell. None while not published.
         self.cache_identity = None
+        # An fd of that directory, held while the listener lives: it pins
+        # the inode, so the identity cannot be reused by a new directory
+        # while this socket can still answer, and stop() cleans up in the
+        # directory the socket was published in even if the path moved.
+        self._cache_fd = None
 
     def _stale_entry(self, root_fd: int) -> tuple[int, int] | None:
         try:
@@ -251,57 +266,68 @@ class ControlServer:
                 return _identity(entry)
         raise ControlError("a mount control socket is already listening")
 
-    def _publish(self, listener: socket.socket) -> tuple[tuple[int, int], tuple[int, int]]:
-        """Publish the listener; return the socket's and the cache's identities."""
+    def _publish(self, listener: socket.socket) -> tuple[tuple[int, int], int]:
+        """Publish the listener; return the socket's identity and a new cache fd.
+
+        The cache fd is a separate open of the locked directory, so holding
+        it does not hold the lock. The caller owns it.
+        """
         if len(os.fsencode(self.path)) > 107:
             raise ControlError("control socket path exceeds the 107-byte Unix socket limit")
         with _locked_cache(self.path.parent) as root:
             _require_private_cache(root)
-            cache = _identity(os.fstat(root))
-            stale = self._stale_entry(root)
-            # Every step below goes through the cache and stage fds, never a
-            # path through the cache, so a renamed or swapped stage cannot
-            # redirect chmod, stat, link or rename. Binding through the stage
-            # fd keeps the longer stage path out of the Unix address limit.
-            name = f".storage.mount.{secrets.token_hex(8)}"
-            # 0700 at most under any umask; a umask that strips owner bits
-            # fails the check below instead of being chmodded around.
-            os.mkdir(name, 0o700, dir_fd=root)
-            # If the open fails, the name may no longer be ours: leave it.
-            stage_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
-            stage = bound = None
+            pinned = os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=root)
             try:
-                entry = os.fstat(stage_fd)
-                _require_new_stage(entry, stage_fd)
-                stage = _identity(entry)
-                staged = f"/proc/self/fd/{stage_fd}/socket"
-                listener.bind(staged)
-                # Nobody else can write the verified stage, so the entry is
-                # the socket just bound; cleanup removes only that.
-                bound = _identity(_require_owner_socket(_entry_at(stage_fd, "socket"), self.path))
-                # Follows a final symlink, but only we can write the stage.
-                os.chmod(staged, 0o600)
-                listener.listen(8)
-                listener.settimeout(0.25)
-                # Our socket is still safe in the pinned stage, but a stage
-                # name that no longer names it means someone is tampering
-                # with the cache: refuse rather than publish beside them.
-                if _identity(_entry_at(root, name)) != stage:
-                    raise ControlError("control socket stage directory changed during startup")
-                if stale is None:
-                    # Keep arbitrary existing entries intact on a racing bind.
-                    os.link("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd,
-                            dst_dir_fd=root, follow_symlinks=False)
-                else:
-                    current = _require_owner_socket(_entry_at(root, CONTROL_SOCKET_NAME), self.path)
-                    if _identity(current) != stale:
-                        raise ControlError("control socket changed during startup")
-                    os.rename("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd, dst_dir_fd=root)
-                return bound, cache
-            finally:
-                if stage is not None:
-                    _remove_stage(root, name, stage_fd, stage, bound)
-                os.close(stage_fd)
+                return self._publish_in(listener, root), pinned
+            except BaseException:
+                os.close(pinned)
+                raise
+
+    def _publish_in(self, listener: socket.socket, root: int) -> tuple[int, int]:
+        stale = self._stale_entry(root)
+        # Every step below goes through the cache and stage fds, never a
+        # path through the cache, so a renamed or swapped stage cannot
+        # redirect chmod, stat, link or rename. Binding through the stage
+        # fd keeps the longer stage path out of the Unix address limit.
+        name = f".storage.mount.{secrets.token_hex(8)}"
+        # 0700 at most under any umask; a umask that strips owner bits
+        # fails the check below instead of being chmodded around.
+        os.mkdir(name, 0o700, dir_fd=root)
+        # If the open fails, the name may no longer be ours: leave it.
+        stage_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+        stage = bound = None
+        try:
+            entry = os.fstat(stage_fd)
+            _require_new_stage(entry, stage_fd)
+            stage = _identity(entry)
+            staged = f"/proc/self/fd/{stage_fd}/socket"
+            listener.bind(staged)
+            # Nobody else can write the verified stage, so the entry is
+            # the socket just bound; cleanup removes only that.
+            bound = _identity(_require_owner_socket(_entry_at(stage_fd, "socket"), self.path))
+            # Follows a final symlink, but only we can write the stage.
+            os.chmod(staged, 0o600)
+            listener.listen(8)
+            listener.settimeout(0.25)
+            # Our socket is still safe in the pinned stage, but a stage
+            # name that no longer names it means someone is tampering
+            # with the cache: refuse rather than publish beside them.
+            if _identity(_entry_at(root, name)) != stage:
+                raise ControlError("control socket stage directory changed during startup")
+            if stale is None:
+                # Keep arbitrary existing entries intact on a racing bind.
+                os.link("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd,
+                        dst_dir_fd=root, follow_symlinks=False)
+            else:
+                current = _require_owner_socket(_entry_at(root, CONTROL_SOCKET_NAME), self.path)
+                if _identity(current) != stale:
+                    raise ControlError("control socket changed during startup")
+                os.rename("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd, dst_dir_fd=root)
+            return bound
+        finally:
+            if stage is not None:
+                _remove_stage(root, name, stage_fd, stage, bound)
+            os.close(stage_fd)
 
     def start(self):
         with self._lock:
@@ -310,10 +336,14 @@ class ControlServer:
             listener = None
             try:
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self._owned_entry, self.cache_identity = self._publish(listener)
+                self._owned_entry, self._cache_fd = self._publish(listener)
+                self.cache_identity = _identity(os.fstat(self._cache_fd))
             except (OSError, ControlError) as exc:
                 if listener is not None:
                     listener.close()
+                if self._cache_fd is not None:
+                    os.close(self._cache_fd)
+                    self._cache_fd = None
                 self._logger.warning("failed to start control socket at %s: %s", self.path, exc)
                 return
             # Each listener gets its own stop event, so a thread that outlived
@@ -332,7 +362,7 @@ class ControlServer:
                 return
             self._stop.set()
             try:
-                with _locked_cache(self.path.parent) as root:
+                with _locked_fd(self._cache_fd) as root:
                     entry = _require_owner_socket(_entry_at(root, CONTROL_SOCKET_NAME), self.path)
                     if _identity(entry) == self._owned_entry:
                         os.unlink(CONTROL_SOCKET_NAME, dir_fd=root)
@@ -342,6 +372,9 @@ class ControlServer:
                 pass
             self._listener.close()
             self._listener = None
+            os.close(self._cache_fd)
+            self._cache_fd = None
+            self.cache_identity = None
             timeout = REQUEST_TIMEOUT + 0.25
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():

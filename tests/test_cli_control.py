@@ -1,5 +1,6 @@
 """Control socket framing, ownership, and CLI routing without a FUSE mount."""
 
+import fcntl
 import json
 import logging
 import os
@@ -133,6 +134,54 @@ def test_preserves_live_listener_and_recovers_stale_socket(cache):
         second.stop()
         first.stop()
     assert not path.exists()
+
+
+def fds_open_on(directory):
+    found = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{fd}") == str(directory):
+                found.append(int(fd))
+        except OSError:
+            pass  # The listing's own fd, closed by now.
+    return found
+
+
+def test_cache_directory_is_pinned_while_listening(cache):
+    # The reported identity must not outlive the directory: holding it open
+    # keeps its inode from being reused while the socket can answer.
+    assert fds_open_on(cache) == []
+    server = server_for(cache, lambda _: {})
+    server.start()
+    try:
+        pinned, = fds_open_on(cache)
+        assert pinned == server._cache_fd
+        entry = os.stat(cache)
+        assert server.cache_identity == (entry.st_dev, entry.st_ino)
+        # The pin is a separate open: it does not hold the cache lock.
+        probe = os.open(cache, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+    finally:
+        server.stop()
+    assert fds_open_on(cache) == []
+    assert server._cache_fd is None and server.cache_identity is None
+    assert not (cache / CONTROL_SOCKET_NAME).exists()
+
+
+def test_stop_cleans_up_in_the_published_directory_after_a_rename(cache):
+    server = server_for(cache, lambda _: {})
+    server.start()
+    moved = cache.with_name(cache.name + "-moved")
+    try:
+        cache.rename(moved)
+        cache.mkdir()
+    finally:
+        server.stop()
+    assert not (moved / CONTROL_SOCKET_NAME).exists()
+    moved.rmdir()
 
 
 def test_never_replaces_arbitrary_entries(cache):
