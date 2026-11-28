@@ -895,10 +895,16 @@ class MemberConnection:
         channel_waited = 0.0
 
         def report_grant():
-            # A channel after a wait: the probe records the last interval
-            # (granted=True); it can no longer veto the channel.
+            # A channel after a wait, once nothing else can fail: the probe
+            # records the last interval (granted=True). Record-only: it
+            # cannot refuse the channel, and whatever it raises is dropped,
+            # so the lease is not stranded.
             if wait_probe and channel_waited > 0:
-                wait_probe(wait_token, channel_waited, granted=True)
+                try:
+                    wait_probe(wait_token, channel_waited, granted=True)
+                except Exception:  # noqa: BLE001 - record-only
+                    self.logger.debug("SSH member %s: a granted channel-wait report failed",
+                                      self.name, exc_info=True)
         # Transports this acquisition may see installed before giving up: a
         # server that drops every new connection must not loop forever.
         connects_left = 2
@@ -974,7 +980,6 @@ class MemberConnection:
                 self._record_sftp_turn_locked(interactive)
                 if not interactive:
                     self._bulk_leased += 1
-                report_grant()
 
             chan = None
             try:
@@ -1026,6 +1031,8 @@ class MemberConnection:
             if stale:
                 _close_quietly(client)
                 continue
+            # The server accepted the channel and the lease is held.
+            report_grant()
             return lease
 
     def _idle_usable_locked(self, interactive: bool) -> bool:

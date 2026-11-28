@@ -77,8 +77,10 @@ def interactive_wait_cancellation(probe):
     time this acquisition has measured in its channel waits. A reason
     returned makes the pool raise BulkCapacityCancelled with it. An
     acquisition that waited and then got a channel calls
-    probe(token, waited, granted=True) once, so the last interval is
-    recorded; that call cannot refuse the channel and its answer is ignored.
+    probe(token, waited, granted=True) once, after the channel is held, so
+    the last interval is recorded. That call is record-only: it cannot
+    refuse the channel, its answer is ignored, and so is anything it
+    raises.
     """
     previous = getattr(_CAPACITY_CANCEL_PROBE, "interactive_probe", None)
     _CAPACITY_CANCEL_PROBE.interactive_probe = probe

@@ -819,6 +819,43 @@ class TestMemberConnectionPool(unittest.TestCase):
         self.assertGreaterEqual(grants[0], max(polls))
         self.assertIs(calls[-1][2], True)
 
+    def test_a_raising_grant_report_does_not_strand_the_channel(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        holder = _Holder(pool)
+        polled = threading.Event()
+
+        def probe(_token, waited, granted=False):
+            if granted:
+                raise RuntimeError("probe bug")
+            if waited > 0:
+                polled.set()
+            return None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                lease = pool.acquire_sftp(1.0)
+            held = pool.snapshot()
+            pool.release(lease)
+            return held
+
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(polled.wait(3))
+            holder.release()
+            self.assertTrue(waiter.join(3))
+            # The caller got its lease despite the report raising.
+            self.assertIsNone(waiter.error)
+        finally:
+            holder.release()
+        # And released, the only channel serves the next caller.
+        other = _InThread(lambda: pool.release(pool.acquire_sftp(1.0)) or True, interactive=True)
+        self.assertTrue(other.join(3))
+        self.assertIsNone(other.error)
+        self.assertEqual(1, pool.snapshot()["idle"])
+        self.assertEqual(1, server.transport.max_open_seen)
+        pool.close()
+
     def test_lease_is_reentrant_within_a_thread(self):
         server = _FakeServer()
         pool = _pool(server, sftp_channels=1)
