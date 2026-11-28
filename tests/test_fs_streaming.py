@@ -1156,6 +1156,30 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(cache.get_free_space_needed(256 * 1024), 128 * 1024)
         self.fs.release("/charged.bin", fd)
 
+    def test_retained_fill_whose_turn_raises_is_not_stranded(self):
+        manager = self.fs._streaming_manager
+        self.backend.worker_gate = threading.Event()
+        raise_now = threading.Event()
+        real_probe = manager._bulk_wait_probe
+
+        def probe(session):
+            # Outside every handler in _run_download_turn: the turn raises
+            # into the pool.
+            if raise_now.is_set():
+                raise RuntimeError("unexpected turn failure")
+            return real_probe(session)
+
+        with patch.object(manager, "_bulk_wait_probe", side_effect=probe):
+            retained = self._open_retained_fill("raises.bin", os.urandom(384 * 1024))
+            raise_now.set()
+            self.backend.worker_gate.set()
+            self.assertTrue(retained.background_finished.wait(timeout=5))
+        self.assertIsNotNone(retained.error)
+        self.assertTrue(retained.detached)
+        self.assertEqual(retained.io_fd, -1)
+        self.assertEqual(manager.list_download_sessions(), [])
+        self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot()[1:] == (0, 0)))
+
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
         session = SimpleNamespace(stop_requested=False, prefetch_complete=False, error=None,

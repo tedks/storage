@@ -184,9 +184,11 @@ class _DownloadPool:
     and neither count against nor wait for the member's bulk ceiling.
     """
 
-    def __init__(self, limit, run_turn, logger):
+    def __init__(self, limit, run_turn, logger, on_turn_failure=None):
         self.limit = limit
         self.run_turn = run_turn
+        # Called, without this pool's lock, for a session whose turn raised.
+        self.on_turn_failure = on_turn_failure
         self.logger = logger
         self.idle_seconds = DOWNLOAD_WORKER_IDLE_SECONDS
         self.condition = threading.Condition()
@@ -429,6 +431,15 @@ class _DownloadPool:
                     self.running.pop(session, None)
                     self._refresh_contention()
                     self.condition.notify_all()
+                if self.on_turn_failure is not None:
+                    # Nothing else would offer the session again: a
+                    # readerless fill would keep its partial and
+                    # descriptor forever.
+                    try:
+                        self.on_turn_failure(session)
+                    except Exception:
+                        self.logger.exception(
+                            "Streaming download turn cleanup failed for %s", session.canonical_path)
 
     def shutdown(self, timeout):
         with self.condition:
@@ -482,6 +493,7 @@ class StreamingReadManager:
             max_download_workers,
             self._run_download_turn,
             logger,
+            on_turn_failure=self._fail_raised_turn,
         )
         if keep_after_close is None:
             keep_after_close = StreamingKeepAfterClose(
@@ -1857,6 +1869,28 @@ class StreamingReadManager:
             waiting_since = None
 
         return probe, restart
+
+    def _fail_raised_turn(self, session: PrefetchSession):
+        """A turn raised out of _run_download_turn: fail the session and finish it.
+
+        The pool has already dropped the turn. Unless the turn's own tail
+        ran (background_finished), a session still missing bytes is errored
+        and finished like any failed one: without readers its prefix is
+        promoted or dropped and it leaves the registry; with readers their
+        release cleans it up. An errored session is never offered again. A
+        complete one is published here instead.
+        """
+        with session.lock:
+            if session.background_finished.is_set():
+                return
+            if session.error is None and not session.prefetch_complete:
+                session.error = RuntimeError("streaming download turn failed")
+            session.condition.notify_all()
+            self._download_pool.offer(session, False)
+        try:
+            self._finish_background_session(session)
+        finally:
+            session.background_finished.set()
 
     def _finish_background_session(self, session: PrefetchSession):
         try:
