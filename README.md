@@ -266,8 +266,9 @@ finish. Readers come first: a new reader that would fit but for retained
 fills discards the one with the fewest bytes to get its session. If the
 cache cannot make enough space for a new reader, or for a whole-file fill
 (a write-open of an uncached file, an open that gets no streaming session),
-it discards unfinished retained fills to make room. If no download worker
-can start, a closed fill is discarded rather than retained.
+it discards unfinished retained fills to make room, fewest bytes first. If no
+download worker can start, a closed fill is discarded rather than retained,
+and a file that has every byte is published by the closing call instead.
 
 All three limits are checked when the mount configuration loads: an
 integer from 1 to 1024 for `max_streaming_sessions`, 0 to 1024 for
@@ -281,9 +282,13 @@ channel, so a waiting worker leaves those bytes available to foreground
 reads on the interactive reserve. If a member can open only one channel,
 the current operation finishes before that channel is passed to a waiter.
 A worker that has waited half a second for one member's bulk capacity
-while files on another member wait for a worker goes to those files, so a
-member whose bulk channels are taken (by sync, say) cannot hold every
-worker.
+while files on another member, or a complete file on any member, wait for
+a worker goes to those files, so a member whose bulk channels are taken
+(by sync, say) cannot hold every worker.
+A worker waiting for a bulk channel stops waiting once foreground reads
+have fetched every byte of its file. Publishing a complete file into the
+cache uses no member channel, so it does not count against or wait for a
+member's bulk capacity, and it takes precedence for the next free worker.
 
 A cached file that has been synced is checked against its member when it
 is opened and was last checked more than `revalidate_after` seconds ago
