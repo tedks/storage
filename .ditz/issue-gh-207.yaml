@@ -14,3 +14,8 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-28T10:12:27-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Epic for https://github.com/tedks/storage/issues/207 (corrective follow-up
+    to merged #184 fa274d4). Branch fix/member-attributes-followup.'
