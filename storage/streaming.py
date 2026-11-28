@@ -69,6 +69,10 @@ ACTIVE_DOWNLOAD_BURST = 4
 # back while another member has runnable work and no free worker (see
 # StreamingReadManager._bulk_wait_probe).
 DOWNLOAD_TURN_YIELD_SECONDS = 0.5
+# In _DownloadPool.contended for queued publication-only turns, which need
+# no member (see _DownloadPool): never a member name, so a turn on any
+# member yields to one.
+LOCAL_PUBLICATION = object()
 
 # link() errors after which _install_partial tries RENAME_NOREPLACE: no
 # hard links on the cache filesystem (EMLINK cannot happen on a fresh
@@ -171,6 +175,11 @@ class _DownloadPool:
     the pool condition before touching a session, so parked sessions hold
     neither a worker nor a network channel. FIFO within each priority gives
     separate readers turns even if one is far ahead.
+
+    A session offered as local has every byte or has stopped: its turn only
+    publishes (finalize, or the cleanup of a failed session), local I/O
+    with no member channel. Local turns are taken first and neither count
+    against nor wait for the member's bulk ceiling.
     """
 
     def __init__(self, limit, run_turn, logger):
@@ -179,8 +188,10 @@ class _DownloadPool:
         self.logger = logger
         self.idle_seconds = DOWNLOAD_WORKER_IDLE_SECONDS
         self.condition = threading.Condition()
-        self.ready: dict[PrefetchSession, bool] = {}
-        self.running: set[PrefetchSession] = set()
+        # Queued sessions -> (has a reader, local); FIFO by insertion.
+        self.ready: dict[PrefetchSession, Tuple[bool, bool]] = {}
+        # Sessions in a turn -> whether it was taken as local.
+        self.running: dict[PrefetchSession, bool] = {}
         self.threads: set[threading.Thread] = set()
         self.active_turns = 0
         self.closing = False
@@ -188,9 +199,16 @@ class _DownloadPool:
         # _refresh_contention.
         self.contended: frozenset = frozenset()
 
+    def _member_load(self):
+        """Turns per member that may hold a member channel (not local ones)."""
+        return Counter(session.backend.name for session, local in self.running.items() if not local)
+
     def _eligible(self):
-        running_by_member = Counter(session.backend.name for session in self.running)
-        for session in self.ready:
+        running_by_member = self._member_load()
+        for session, (_, local) in self.ready.items():
+            if local:
+                yield session
+                continue
             member = session.backend.name
             capacity = session.backend.background_range_capacity()
             if capacity is None or running_by_member[member] < capacity:
@@ -214,7 +232,7 @@ class _DownloadPool:
                     break
                 retried = True
 
-    def offer(self, session, ready, finished_turn=False):
+    def offer(self, session, ready, finished_turn=False, local=False):
         """Queue or withdraw a session after its readiness may have changed.
 
         Every FUSE read offers its session, so an offer that changes
@@ -223,16 +241,18 @@ class _DownloadPool:
         one worker. It still retries a worker start when the pool has no
         thread at all, which is how a failed start is retried while readers
         keep reading.
+
+        local marks a publication-only turn (see the class docstring).
         """
         with self.condition:
             if finished_turn:
-                self.running.remove(session)
+                del self.running[session]
             elif session in self.running:
                 # Its turn offers it again when it ends.
                 return
             else:
                 queued = self.ready.get(session)
-                wanted = session.refcount > 0 if ready and not self.closing else None
+                wanted = (session.refcount > 0, local) if ready and not self.closing else None
                 if queued == wanted:
                     if wanted is not None:
                         if self.threads:
@@ -244,10 +264,14 @@ class _DownloadPool:
                             self._grow()
                     return
             if ready and not self.closing:
-                self.ready[session] = session.refcount > 0
+                self.ready[session] = (session.refcount > 0, local)
                 self._grow()
             else:
                 self.ready.pop(session, None)
+                if finished_turn and not self.threads and self.ready and not self.closing:
+                    # The end of an inline turn (take_unstaffed): retry a
+                    # worker for what queued meanwhile.
+                    self._grow()
             self._refresh_contention()
             self.condition.notify_all()
 
@@ -259,12 +283,21 @@ class _DownloadPool:
         which runs under the member pool's lock: this pool already takes
         that lock (background_range_capacity) under its own, so the probe
         must not take this one. A frozenset is replaced, never mutated, so
-        a reader sees one whole snapshot.
+        a reader sees one whole snapshot. Queued publication-only work is
+        published as LOCAL_PUBLICATION.
+
+        Saturation is measured against the live threads as well as the
+        limit: a pool whose growth failed (a thread could not start) has no
+        more workers than it has threads, and its queued work waits just
+        the same.
         """
-        if len(self.running) < self.limit:
+        if len(self.running) < min(self.limit, len(self.threads)):
             self.contended = frozenset()
         else:
-            self.contended = frozenset(session.backend.name for session in self._eligible())
+            self.contended = frozenset(
+                LOCAL_PUBLICATION if self.ready[session][1] else session.backend.name
+                for session in self._eligible()
+            )
 
     def unstaffed(self, session):
         """Whether the session is queued while the pool has no worker thread.
@@ -290,15 +323,25 @@ class _DownloadPool:
             self._refresh_contention()
             return session not in self.running
 
-    def take_unstaffed(self, session):
-        """Let a caller finish a local-only publication when no thread starts."""
+    def take_unstaffed(self, session=None):
+        """Let a caller run a local-only publication when no thread starts.
+
+        Takes session's turn, or with None the first queued local one, and
+        returns the session taken, or None. The caller has checked that
+        session needs only local work; queued local ones do by definition
+        (being terminal is permanent).
+        """
         with self.condition:
-            if self.threads or len(self.running) >= self.limit or session not in self.ready:
-                return False
-            self.ready.pop(session)
-            self.running.add(session)
+            if self.threads or len(self.running) >= self.limit:
+                return None
+            if session is None:
+                session = next((queued for queued, (_, local) in self.ready.items() if local), None)
+            if session is None or session not in self.ready:
+                return None
+            del self.ready[session]
+            self.running[session] = True
             self._refresh_contention()
-            return True
+            return session
 
     def snapshot(self):
         with self.condition:
@@ -307,11 +350,19 @@ class _DownloadPool:
     def _take(self):
         if len(self.running) >= self.limit:
             return None
+        # A publication first: it is short, needs no member, and frees a
+        # registry slot and a descriptor.
+        local = next((session for session, (_, is_local) in self.ready.items() if is_local), None)
+        if local is not None:
+            del self.ready[local]
+            self.running[local] = True
+            self._refresh_contention()
+            return local
         active = closed = None
         # Member headroom is based on in-flight work. Each priority gets
         # its first choice of that headroom before either is selected.
-        running_by_member = Counter(session.backend.name for session in self.running)
-        for session, has_reader in self.ready.items():
+        running_by_member = self._member_load()
+        for session, (has_reader, _) in self.ready.items():
             capacity = session.backend.background_range_capacity()
             if capacity is not None and running_by_member[session.backend.name] >= capacity:
                 continue
@@ -328,8 +379,8 @@ class _DownloadPool:
             session = active
             self.active_turns = self.active_turns + 1 if closed is not None else 0
         if session is not None:
-            self.ready.pop(session)
-            self.running.add(session)
+            del self.ready[session]
+            self.running[session] = False
             self._refresh_contention()
         return session
 
@@ -341,6 +392,7 @@ class _DownloadPool:
                     remaining = idle_until - time.monotonic()
                     if self.closing or remaining <= 0:
                         self.threads.remove(threading.current_thread())
+                        self._refresh_contention()
                         return
                     self.condition.wait(remaining)
             try:
@@ -348,7 +400,7 @@ class _DownloadPool:
             except Exception:
                 self.logger.exception("Streaming download turn failed for %s", session.canonical_path)
                 with self.condition:
-                    self.running.discard(session)
+                    self.running.pop(session, None)
                     self._refresh_contention()
                     self.condition.notify_all()
 
@@ -1579,12 +1631,14 @@ class StreamingReadManager:
 
         Caller holds session.lock and has already claimed any foreground
         range it plans to fetch. A file waiting for a read or for a range
-        already claimed by a reader takes no pool slot.
+        already claimed by a reader takes no pool slot. A terminal session
+        is offered as local: its turn only publishes.
         """
+        terminal = self._download_terminal(session)
         ready = not session.worker_done and (
-            self._download_terminal(session) or self._next_background_fetch(session) is not None
+            terminal or self._next_background_fetch(session) is not None
         )
-        self._download_pool.offer(session, ready, finished_turn=finished_turn)
+        self._download_pool.offer(session, ready, finished_turn=finished_turn, local=terminal)
 
     def _fetch_background_chunk(self, session: PrefetchSession):
         with session.lock:
@@ -1609,17 +1663,24 @@ class StreamingReadManager:
             fetch_due = self._next_background_fetch(session) is not None
 
         if fetch_due:
+            probe, restart_wait = self._bulk_wait_probe(session)
+
+            def fetch():
+                # A lease is held now. A retry after a lost connection
+                # acquires again, and waits its own yield interval.
+                restart_wait()
+                self._fetch_background_chunk(session)
+
             try:
                 # Do not own a range while waiting for a bulk lease. A
                 # reader can claim the bytes and use the interactive reserve.
-                with capacity_wait_cancellation(self._bulk_wait_probe(session)):
-                    session.backend.run_background_range_read(
-                        session.canonical_path, lambda: self._fetch_background_chunk(session),
-                    )
+                with capacity_wait_cancellation(probe):
+                    session.backend.run_background_range_read(session.canonical_path, fetch)
             except BulkCapacityCancelled:
-                # This session's stop request, or a yield to another member
-                # (_bulk_wait_probe); no range was claimed. A yielded
-                # session is queued again below.
+                # This session's stop request, its readers having fetched
+                # every byte, or a yield to other work (_bulk_wait_probe);
+                # no range was claimed. A yielded session is queued again
+                # below; a complete one is published.
                 pass
             except Exception as exc:
                 with session.lock:
@@ -1650,20 +1711,30 @@ class StreamingReadManager:
     def _bulk_wait_probe(self, session: PrefetchSession):
         """The cancellation probe for one turn's wait for member bulk capacity.
 
-        The member pool polls it while the turn waits for a bulk lease (and
-        once before each attempt), under the member pool's lock, so it reads
-        only state that needs no lock: the session's stop flag and the
-        download pool's published contention (_DownloadPool.contended).
-        Taking the download pool's lock here would invert the order in
-        which the pool asks a member for its capacity.
+        Returns (probe, restart). The member pool polls probe while the
+        turn waits for a bulk lease (and once before each attempt), under
+        the member pool's lock, so it reads only state that needs no lock:
+        the session's terminal flags and the download pool's published
+        contention (_DownloadPool.contended). Taking the download pool's
+        lock (or the session's: offers take the member's lock under it)
+        here would invert the order in which the pool asks a member for its
+        capacity. A stale read only delays the end of the wait by one poll.
 
-        Besides a stop, it ends a wait that has lasted
-        DOWNLOAD_TURN_YIELD_SECONDS while another member has runnable work
-        and every worker is busy. Without that, every worker can sit behind
-        one member's bulk leases (held by sync, say) while files on other
-        members get no turn. The yielded session claimed no range and is
-        queued again behind the work it yielded to. Two members that are
-        both out of leases trade the worker once per interval.
+        It ends the wait when the session stops, fails, or has every byte:
+        readers on the interactive reserve can fetch the rest while the
+        turn waits, and a complete file needs no channel, only publication.
+        Otherwise it ends a wait that has lasted DOWNLOAD_TURN_YIELD_SECONDS
+        while other work has no worker: another member's runnable session,
+        or a queued publication on any member. Without that, every worker
+        can sit behind one member's bulk leases (held by sync, say) while
+        files on other members get no turn. The yielded session claimed no
+        range and is queued again behind the work it yielded to. Two
+        members that are both out of leases trade the worker once per
+        interval.
+
+        restart starts the interval again; the turn calls it once it holds
+        a lease, so an acquisition retried after a lost connection is not
+        charged for the earlier wait.
         """
         pool = self._download_pool
         member = session.backend.name
@@ -1673,14 +1744,20 @@ class StreamingReadManager:
             nonlocal waiting_since
             if session.stop_requested:
                 return "streaming session"
+            if session.prefetch_complete or session.error is not None:
+                return "streaming session needing no transfer"
             now = time.monotonic()
             if waiting_since is None:
                 waiting_since = now
             elif now - waiting_since >= DOWNLOAD_TURN_YIELD_SECONDS and pool.contended - {member}:
-                return "streaming turn yielded to another member"
+                return "streaming turn yielded to other work"
             return None
 
-        return probe
+        def restart():
+            nonlocal waiting_since
+            waiting_since = None
+
+        return probe, restart
 
     def _finish_background_session(self, session: PrefetchSession):
         try:
@@ -1713,10 +1790,19 @@ class StreamingReadManager:
         session.background_finished.set()
 
     def _finish_unstaffed_download(self, session: PrefetchSession):
+        """Publish a terminal session inline when the pool has no thread.
+
+        While this caller holds the pool's turn (with one worker allowed,
+        its only one), another caller's take_unstaffed is refused and
+        returns, leaving its complete file queued. So after each turn this
+        one takes the next queued publication, until none is left or a
+        worker has started (the end of the turn retries one).
+        """
         with session.lock:
-            claimed = self._download_terminal(session) and self._download_pool.take_unstaffed(session)
-        if claimed:
-            self._run_download_turn(session)
+            claimed = self._download_pool.take_unstaffed(session) if self._download_terminal(session) else None
+        while claimed is not None:
+            self._run_download_turn(claimed)
+            claimed = self._download_pool.take_unstaffed()
 
     def _attach(self, session: PrefetchSession) -> bool:
         """Add a reader to a registered session; False if it failed or its cleanup is claimed.

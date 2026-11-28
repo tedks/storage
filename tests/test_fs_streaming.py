@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fuse import FuseOSError
@@ -440,6 +441,230 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release(path, fd)
             self.assertEqual(attempts, 2)
             self.assertEqual((self.cache_dir / "retry.bin").read_bytes(), payload)
+
+    def _bulk_gate(self, poll_probe=True):
+        """A run_background_range_read that waits for bulk capacity until released.
+
+        Like the SSH pool's bulk wait, it polls the turn's cancellation
+        probe (unless poll_probe is False) and raises BulkCapacityCancelled
+        with the probe's reason. Returns (fake, released, waiting, reasons).
+        """
+        released = threading.Event()
+        self.addCleanup(released.set)
+        waiting = threading.Event()
+        reasons = []
+
+        def await_bulk(_path, fetch):
+            probe = current_capacity_cancel_probe()
+            waiting.set()
+            while not released.is_set():
+                reason = probe() if poll_probe else None
+                if reason:
+                    reasons.append(reason)
+                    raise BulkCapacityCancelled(reason)
+                time.sleep(0.02)
+            return fetch()
+
+        return await_bulk, released, waiting, reasons
+
+    def _fail_worker_starts(self, after):
+        """A Thread.start that fails for download workers past the first `after`."""
+        real_start = threading.Thread.start
+        started = []
+
+        def start(thread):
+            if thread.name == "storage-prefetch-worker":
+                started.append(thread)
+                if len(started) > after:
+                    raise RuntimeError("worker creation failed")
+            return real_start(thread)
+
+        return start, started
+
+    def test_bulk_wait_ends_when_readers_fetch_every_byte(self):
+        payload = os.urandom(256 * 1024)
+        (self.backend_dir / "foreground.bin").write_bytes(payload)
+        path = "/foreground.bin"
+        half = 128 * 1024
+        await_bulk, released, waiting, reasons = self._bulk_gate()
+        with patch.object(self.backend, "run_background_range_read", side_effect=await_bulk):
+            fd = self.fs.open(path, os.O_RDONLY)
+            session = self._session_for(fd)
+            self.assertEqual(self.fs.read(path, half, 0, fd), payload[:half])
+            self.assertTrue(waiting.wait(timeout=3))
+            # The interactive reserve serves the rest while the turn still
+            # waits for a bulk channel that never comes free.
+            self.assertEqual(self.fs.read(path, half, half, fd), payload[half:])
+            self.assertTrue(session.background_finished.wait(timeout=3))
+            self.assertTrue(session.finalized)
+            self.assertFalse(released.is_set())
+            self.assertTrue(reasons)
+            self.fs.release(path, fd)
+        self.assertEqual((self.cache_dir / "foreground.bin").read_bytes(), payload)
+        self.assertEqual(self.fs._streaming_manager.list_download_sessions(), [])
+
+    def _open_blocked_and_complete(self, await_bulk, waiting):
+        """Open a file whose turn waits for bulk capacity, then read a second file whole.
+
+        Both are on self.backend. Returns (blocked, blocked_fd, complete, complete_fd).
+        """
+        payload = os.urandom(256 * 1024)
+        for name in ("blocked.bin", "complete.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        blocked_fd = self.fs.open("/blocked.bin", os.O_RDONLY)
+        blocked = self._session_for(blocked_fd)
+        self.assertEqual(self.fs.read("/blocked.bin", 128 * 1024, 0, blocked_fd), payload[:128 * 1024])
+        self.assertTrue(waiting.wait(timeout=3))
+        complete_fd = self.fs.open("/complete.bin", os.O_RDONLY)
+        complete = self._session_for(complete_fd)
+        self.assertEqual(self.fs.read("/complete.bin", len(payload), 0, complete_fd), payload)
+        self.assertTrue(complete.prefetch_complete)
+        return blocked, blocked_fd, complete, complete_fd, payload
+
+    def test_publication_turn_is_not_held_by_the_members_bulk_ceiling(self):
+        # The fake never yields, so only the scheduler can start the
+        # publication: one member bulk slot, held by the blocked turn.
+        await_bulk, released, waiting, _ = self._bulk_gate(poll_probe=False)
+        with patch.object(self.backend, "run_background_range_read", side_effect=await_bulk), \
+                patch.object(self.backend, "background_range_capacity", return_value=1):
+            blocked, blocked_fd, complete, complete_fd, payload = self._open_blocked_and_complete(
+                await_bulk, waiting)
+            self.assertTrue(complete.background_finished.wait(timeout=3))
+            self.assertTrue(complete.finalized)
+            self.assertFalse(blocked.prefetch_complete)
+            released.set()
+            self.assertTrue(blocked.background_finished.wait(timeout=5))
+            self.fs.release("/complete.bin", complete_fd)
+            self.fs.release("/blocked.bin", blocked_fd)
+        self.assertEqual((self.cache_dir / "complete.bin").read_bytes(), payload)
+        self.assertEqual((self.cache_dir / "blocked.bin").read_bytes(), payload)
+
+    def test_busy_workers_yield_to_a_queued_publication_on_their_own_member(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=1)
+        await_bulk, released, waiting, reasons = self._bulk_gate()
+        with patch.object(self.backend, "run_background_range_read", side_effect=await_bulk):
+            blocked, blocked_fd, complete, complete_fd, payload = self._open_blocked_and_complete(
+                await_bulk, waiting)
+            self.assertTrue(complete.background_finished.wait(timeout=5))
+            self.assertTrue(complete.finalized)
+            self.assertTrue(reasons)
+            self.assertFalse(blocked.prefetch_complete)
+            released.set()
+            self.assertTrue(blocked.background_finished.wait(timeout=5))
+            self.fs.release("/complete.bin", complete_fd)
+            self.fs.release("/blocked.bin", blocked_fd)
+        self.assertEqual((self.cache_dir / "complete.bin").read_bytes(), payload)
+        self.assertEqual((self.cache_dir / "blocked.bin").read_bytes(), payload)
+
+    def test_worker_yields_when_the_pools_second_worker_could_not_start(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=2)
+        other = SlowRangeLocalBackend("other", str(self.backend_dir), range_delay=0.0)
+        payload = os.urandom(256 * 1024)
+        for name in ("blocked.bin", "free.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        await_bulk, released, waiting, reasons = self._bulk_gate()
+        start, started = self._fail_worker_starts(after=1)
+
+        def select(path):
+            return other if path == "/free.bin" else self.backend
+
+        with patch.object(manager, "select_backend_for_read", side_effect=select), \
+                patch.object(self.backend, "run_background_range_read", side_effect=await_bulk), \
+                patch.object(threading.Thread, "start", start):
+            blocked_fd = self.fs.open("/blocked.bin", os.O_RDONLY)
+            blocked = self._session_for(blocked_fd)
+            self.assertEqual(self.fs.read("/blocked.bin", 128 * 1024, 0, blocked_fd), payload[:128 * 1024])
+            self.assertTrue(waiting.wait(timeout=3))
+            free_fd = self.fs.open("/free.bin", os.O_RDONLY)
+            free = self._session_for(free_fd)
+            self.assertIs(free.backend, other)
+            self.assertEqual(self.fs.read("/free.bin", 128 * 1024, 0, free_fd), payload[:128 * 1024])
+            self.assertTrue(free.background_finished.wait(timeout=10))
+            self.assertTrue(free.finalized)
+            self.assertGreater(len(started), 1)
+            self.assertEqual(manager._download_pool.snapshot()[0], 1)
+            self.assertTrue(reasons)
+            self.assertFalse(blocked.prefetch_complete)
+            released.set()
+            self.assertTrue(blocked.background_finished.wait(timeout=10))
+            self.fs.release("/free.bin", free_fd)
+            self.fs.release("/blocked.bin", blocked_fd)
+        self.assertEqual((self.cache_dir / "free.bin").read_bytes(), payload)
+        self.assertEqual((self.cache_dir / "blocked.bin").read_bytes(), payload)
+
+    def test_concurrent_last_closes_without_workers_publish_both_files(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=1)
+        start, _ = self._fail_worker_starts(after=0)
+        real_finalize = manager._finalize_streaming_session
+        paused = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+
+        def finalize(session):
+            if session.canonical_path == "/first.bin":
+                paused.set()
+                resume.wait(timeout=10)
+            return real_finalize(session)
+
+        files = {}
+        with patch.object(threading.Thread, "start", start), \
+                patch.object(manager, "_finalize_streaming_session", side_effect=finalize):
+            for name in ("first.bin", "second.bin"):
+                payload = os.urandom(8192)
+                (self.backend_dir / name).write_bytes(payload)
+                path = "/" + name
+                fd = self.fs.open(path, os.O_RDONLY)
+                session = self._session_for(fd)
+                self.assertEqual(self.fs.read(path, len(payload), 0, fd), payload)
+                self.assertTrue(session.prefetch_complete)
+                files[name] = (path, fd, session, payload)
+            self.assertEqual(manager._download_pool.snapshot(), (0, 0, 2))
+
+            path, fd, first, _ = files["first.bin"]
+            closer = threading.Thread(target=self.fs.release, args=(path, fd), daemon=True)
+            closer.start()
+            try:
+                self.assertTrue(paused.wait(timeout=3))
+                path, fd, second, _ = files["second.bin"]
+                # The inline publication of first.bin holds the only turn.
+                self.fs.release(path, fd)
+                self.assertFalse(second.finalized)
+            finally:
+                resume.set()
+                closer.join(timeout=5)
+            self.assertFalse(closer.is_alive())
+        for name, (_, _, session, payload) in files.items():
+            self.assertTrue(session.finalized, name)
+            self.assertTrue(session.background_finished.is_set(), name)
+            self.assertEqual(session.io_fd, -1, name)
+            self.assertEqual((self.cache_dir / name).read_bytes(), payload)
+        self.assertEqual(manager.list_download_sessions(), [])
+        self.assertEqual(manager._download_pool.snapshot(), (0, 0, 0))
+
+    def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
+        manager = self.fs._streaming_manager
+        session = SimpleNamespace(stop_requested=False, prefetch_complete=False, error=None,
+                                  backend=SimpleNamespace(name="backend"))
+        pool = manager._download_pool
+        with pool.condition:
+            saved, pool.contended = pool.contended, frozenset({"other"})
+        try:
+            with patch("storage.streaming.DOWNLOAD_TURN_YIELD_SECONDS", 0.05):
+                probe, restart = manager._bulk_wait_probe(session)
+                self.assertIsNone(probe())
+                time.sleep(0.1)
+                self.assertIsNotNone(probe())
+                # A retry after a lost connection waits its own interval.
+                restart()
+                self.assertIsNone(probe())
+                session.prefetch_complete = True
+                self.assertIsNotNone(probe())
+        finally:
+            with pool.condition:
+                pool.contended = saved
 
     def test_unexpected_download_finalize_error_releases_worker_for_next_file(self):
         manager = self.fs._streaming_manager
