@@ -1120,34 +1120,67 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(cache_path.exists())
         self.assertFalse(partial_path.exists())
 
-    def test_streaming_open_retries_on_partial_enoent_with_final_fallback(self):
+    def _real_fd(self, vfd):
+        with self.fs._fd_lock:
+            return self.fs._fd_map[vfd].real_fd
+
+    def test_streaming_open_reads_the_session_inode_when_its_path_is_gone(self):
+        # The attached session's partial path no longer names its file (a
+        # rename race, or the path was removed); the reader still opens the
+        # session's own inode instead of failing or opening another file.
         payload = os.urandom(256 * 1024)
         (self.backend_dir / "race.bin").write_bytes(payload)
-
         seed_vfd = self.fs.open('/race.bin', os.O_RDONLY)
-        with self.fs._fd_lock:
-            seed_entry = self.fs._fd_map[seed_vfd]
-        self.assertIsNotNone(seed_entry.prefetch_session)
-        session = seed_entry.prefetch_session
+        session = self._session_for(seed_vfd)
+        self.assertEqual(self.fs.read('/race.bin', 4096, 0, seed_vfd), payload[:4096])
+        session.partial_cache_path.unlink()
 
-        session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        session.final_cache_path.write_bytes(payload)
-
-        real_os_open = os.open
-        partial_path = str(session.partial_cache_path)
-        raised_once = {"value": False}
-
-        def flaky_open(path, flags, mode=0o777):
-            if path == partial_path and not raised_once["value"]:
-                raised_once["value"] = True
-                raise FileNotFoundError(errno.ENOENT, "simulated partial rename race", path)
-            return real_os_open(path, flags, mode)
-
-        with patch("storage.fs.os.open", side_effect=flaky_open):
-            retry_vfd = self.fs.open('/race.bin', os.O_RDONLY)
-
+        retry_vfd = self.fs.open('/race.bin', os.O_RDONLY)
+        self.assertIs(self._session_for(retry_vfd), session)
+        self.assertEqual(os.fstat(self._real_fd(retry_vfd)).st_ino, os.fstat(session.io_fd).st_ino)
+        self.assertEqual(self.fs.read('/race.bin', 4096, 0, retry_vfd), payload[:4096])
         self.fs.release('/race.bin', retry_vfd)
         self.fs.release('/race.bin', seed_vfd)
+
+    def test_attached_open_keeps_its_session_inode_when_a_successor_takes_the_path(self):
+        # Council round 2 on #190 (R2-C1): an open attaches to session A and,
+        # before it opens a descriptor, A fails and another open replaces it
+        # with B at the same partial path. Opened by path, the first opener
+        # would read B's sparse file through A's range map: zeros for bytes
+        # A has. It must get A's inode.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "swap.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/swap.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        self.assertEqual(self.fs.read('/swap.bin', 4096, 0, vfd_a), payload[:4096])
+
+        real_create = manager._create_or_attach_prefetch_session
+        successor = {}
+
+        def attach_then_replace(virtual_path, canonical_path):
+            attached = real_create(virtual_path, canonical_path)
+            self.assertIs(attached, session_a)
+            with session_a.lock:
+                session_a.error = OSError(errno.EHOSTUNREACH, "simulated drop")
+                manager._schedule_background(session_a)
+            successor["session"] = real_create(virtual_path, canonical_path)
+            return attached
+
+        with patch.object(manager, "_create_or_attach_prefetch_session", side_effect=attach_then_replace):
+            vfd_c = self.fs.open('/swap.bin', os.O_RDONLY)
+        session_b = successor["session"]
+        self.assertIsInstance(session_b, PrefetchSession)
+        self.assertIsNot(session_b, session_a)
+        self.assertIs(self._session_for(vfd_c), session_a)
+        self.assertEqual(os.stat(session_a.partial_cache_path).st_ino, os.fstat(session_b.io_fd).st_ino)
+        self.assertEqual(os.fstat(self._real_fd(vfd_c)).st_ino, os.fstat(session_a.io_fd).st_ino)
+        # A's bytes, not B's hole.
+        self.assertEqual(self.fs.read('/swap.bin', 4096, 0, vfd_c), payload[:4096])
+        self.fs.release('/swap.bin', vfd_c)
+        self.fs.release('/swap.bin', vfd_a)
+        manager._release_prefetch_session(session_b)
 
     def test_streaming_release_drops_reader_ref_when_close_fails(self):
         payload = os.urandom(128 * 1024)

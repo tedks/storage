@@ -2570,13 +2570,13 @@ class StorageFS(Operations):
             # _invalidate_file_cache (which also holds _fd_lock) cannot
             # unlink the cache file between os.open and registration.
             with self._fd_lock:
-                try:
+                if prefetch_session is None:
                     real_fd = os.open(str(cache_path), flags)
-                except FileNotFoundError:
-                    if prefetch_session is None:
-                        raise
-                    cache_path = prefetch_session.final_cache_path
-                    real_fd = os.open(str(cache_path), flags)
+                else:
+                    # The session's own inode, whatever its path names now.
+                    real_fd = self._streaming_manager.open_session_inode(prefetch_session, flags)
+                    if prefetch_session.finalized:
+                        cache_path = prefetch_session.final_cache_path
 
                 vfd = self._fd_counter
                 self._fd_counter += 1

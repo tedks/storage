@@ -1157,6 +1157,23 @@ class StreamingReadManager:
             except OSError:
                 pass
 
+    def open_session_inode(self, session: PrefetchSession, flags: int) -> int:
+        """Open the session's own file for a reader that holds a ref on it.
+
+        Never by its path: once a session fails and a later open replaces
+        it, its partial path names the successor's file, whose range map is
+        not this session's (ranges this session has would read as the
+        successor's holes). /proc/self/fd reopens the inode the session
+        writes, linked, renamed into the cache or unlinked. io_lock keeps
+        the descriptor from closing meanwhile; it closes only at the last
+        release (or destroy, when the open gets ENOENT).
+        """
+        with session.io_lock:
+            io_fd = session.io_fd
+            if io_fd < 0:
+                raise FileNotFoundError(errno.ENOENT, "streaming session closed")
+            return os.open(f"/proc/self/fd/{io_fd}", flags & ~os.O_NOFOLLOW)
+
     def _remove_prefetch_session(self, session: PrefetchSession):
         with self.prefetch_sessions_lock:
             current = self.prefetch_sessions.get(session.canonical_path)
