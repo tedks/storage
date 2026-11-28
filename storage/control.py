@@ -108,8 +108,12 @@ def request_control_payload(cache_root: Path, request: bytes, timeout: float) ->
 
 @contextmanager
 def _locked_cache(cache_root: Path):
-    # Serialize socket publication and cleanup by cache, including two
-    # mountpoints configured with the same cache. No new lockfile is needed.
+    # Exclude concurrent socket publication and cleanup by cache, including
+    # two mountpoints configured with the same cache. The lock does not wait:
+    # whoever holds it wins, and the other side fails with BlockingIOError
+    # (start logs a warning and runs without a socket; stop leaves the entry,
+    # which a later start takes over once its listener is gone). The cache
+    # directory itself is the lock, so no new lockfile is needed.
     fd = os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
