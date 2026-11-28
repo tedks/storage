@@ -1464,6 +1464,61 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
         self.assertEqual(manager.list_download_sessions(), [])
 
+    def test_same_member_confirmations_do_not_trade_the_worker(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=1)
+        busy = threading.Event()
+        self.addCleanup(busy.clear)
+        stat, reasons = self._channel_busy_stat(busy)
+        sessions = []
+        with patch.object(self.backend, "stat", side_effect=stat), \
+                patch.object(self.backend, "interactive_wait_budget", return_value=1.0):
+            busy.set()
+            for name in ("first-held.bin", "second-held.bin"):
+                payload = os.urandom(64 * 1024)
+                (self.backend_dir / name).write_bytes(payload)
+                fd = self.fs.open("/" + name, os.O_RDONLY)
+                sessions.append(self._session_for(fd))
+                self.assertEqual(self.fs.read("/" + name, len(payload), 0, fd), payload)
+                self.fs.release("/" + name, fd)
+            for session in sessions:
+                self.assertTrue(session.background_finished.wait(timeout=8))
+        # Each waited out its own budget once; neither yielded to the other.
+        self.assertEqual(reasons, ["streaming publication's channel wait budget"] * 2)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_unconfirmed_discards"], 2)
+        for name in ("first-held.bin", "second-held.bin"):
+            self.assertFalse((self.cache_dir / name).exists())
+
+    def test_confirmation_wait_budget_is_not_reset_by_a_yield(self):
+        manager = self.fs._streaming_manager
+        pool = manager._download_pool
+        backend = SimpleNamespace(name="backend", interactive_wait_budget=lambda: 1.0)
+        session = SimpleNamespace(stop_requested=False, backend=backend,
+                                  confirmation_waited=0.0, confirmation_timed_out=False)
+        clock = [0.0]
+        with pool.condition:
+            saved, pool.contended = pool.contended, frozenset({"other"})
+        try:
+            with patch("storage.streaming.time.monotonic", side_effect=lambda: clock[0]):
+                probe = manager._publication_wait_probe(session)
+                self.assertIsNone(probe())
+                clock[0] = 0.6
+                self.assertEqual(probe(), "streaming publication yielded to other work")
+                # The requeued attempt has 0.4 s left, not a fresh second.
+                probe = manager._publication_wait_probe(session)
+                clock[0] = 10.0
+                self.assertIsNone(probe())
+                with pool.condition:
+                    pool.contended = frozenset()
+                clock[0] = 10.3
+                self.assertIsNone(probe())
+                clock[0] = 10.4
+                self.assertEqual(probe(), "streaming publication's channel wait budget")
+                self.assertTrue(session.confirmation_timed_out)
+        finally:
+            with pool.condition:
+                pool.contended = saved
+
     def test_offer_during_turn_failure_recovery_starts_no_second_turn(self):
         manager = self.fs._streaming_manager
         pool = manager._download_pool

@@ -176,6 +176,13 @@ class Backend(ABC):
         """The member's limit on concurrent background range reads, if any."""
         return None
 
+    def interactive_wait_budget(self) -> Optional[float]:
+        """Seconds an interactive request may wait for a channel, if bounded.
+
+        None for a member whose requests never wait for one.
+        """
+        return None
+
     def run_background_range_read(self, virtual_path, fetch):
         """Hold member capacity before claiming a speculative byte range.
 

@@ -71,9 +71,11 @@ ACTIVE_DOWNLOAD_BURST = 4
 # back while another member has runnable work and no free worker (see
 # StreamingReadManager._bulk_wait_probe).
 DOWNLOAD_TURN_YIELD_SECONDS = 0.5
-# In _DownloadPool.contended for queued publication-only turns, which need
-# no member (see _DownloadPool): never a member name, so a turn on any
-# member yields to one.
+# In _DownloadPool.contended, paired with the member's name, for a queued
+# publication-only turn: (LOCAL_PUBLICATION, member). It needs no bulk
+# channel, so a range turn waiting for bulk on any member yields to it; a
+# confirmation yields only to one on another member (it needs the same
+# interactive channel; see _publication_wait_probe).
 LOCAL_PUBLICATION = object()
 
 # link() errors after which _install_partial tries RENAME_NOREPLACE: no
@@ -175,6 +177,12 @@ class PrefetchSession:
     # destroy): finalize makes no member stat, and the unconfirmed result
     # is discarded as master's rule discards any result not agreed.
     unconfirmed_publication: bool = False
+    # Seconds a worker's confirming stat has already spent waiting for a
+    # channel in attempts that yielded; a requeued attempt gets only the
+    # rest of the member's wait budget (see _publication_wait_probe).
+    confirmation_waited: float = 0.0
+    # Set when that budget ran out: finalize discards, as unconfirmed.
+    confirmation_timed_out: bool = False
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -311,7 +319,7 @@ class _DownloadPool:
         that lock (background_range_capacity) under its own, so the probe
         must not take this one. A frozenset is replaced, never mutated, so
         a reader sees one whole snapshot. Queued publication-only work is
-        published as LOCAL_PUBLICATION.
+        published as (LOCAL_PUBLICATION, member).
 
         Saturation is measured against the live threads as well as the
         limit: a pool whose growth failed (a thread could not start) has no
@@ -322,7 +330,8 @@ class _DownloadPool:
             self.contended = frozenset()
         else:
             self.contended = frozenset(
-                LOCAL_PUBLICATION if self.ready[session][1] else session.backend.name
+                (LOCAL_PUBLICATION, session.backend.name) if self.ready[session][1]
+                else session.backend.name
                 for session in self._eligible()
             )
 
@@ -1617,6 +1626,12 @@ class StreamingReadManager:
                     # contention: nothing is published, and the finish
                     # takes the cancelled-session cleanup.
                     return
+                if session.confirmation_timed_out:
+                    # The member's wait budget ran out across attempts:
+                    # unconfirmed, so discarded like any result not agreed.
+                    self._discard_superseded_session(session, "unconfirmed")
+                    self._record_streaming_stat("streaming_unconfirmed_discards", 1)
+                    return
                 if current_interactive_cancel_probe() is not None:
                     # The turn's channel-wait probe gave up under contention.
                     raise _PublicationYielded() from exc
@@ -1908,12 +1923,23 @@ class StreamingReadManager:
         for an interactive channel: a member that negotiated one channel,
         held by a bulk transfer, or a reserve taken by other confirmations.
         After DOWNLOAD_TURN_YIELD_SECONDS with other work waiting for a
-        worker (another member's, or a publication), the stat gives up and
-        the turn queues the publication again behind that work. Without
-        that wait, the stat waits out the member's connect deadline.
+        worker, the stat gives up and the turn queues the publication again
+        behind that work. Other work means another member's session or
+        publication: a publication on the same member needs the same
+        channel, so it is no reason to yield (two of them would trade the
+        worker forever).
+
+        The wait is bounded across yields by the member's
+        interactive_wait_budget (its connect deadline): the time spent in
+        earlier attempts is kept on the session, and once the total
+        reaches the budget the stat gives up for good and finalize
+        discards the file as unconfirmed. Without a budget, each attempt
+        waits out the member's own deadline.
         """
         pool = self._download_pool
         member = session.backend.name
+        own_publications = (LOCAL_PUBLICATION, member)
+        budget = session.backend.interactive_wait_budget()
         waiting_since = None
 
         def probe():
@@ -1923,7 +1949,12 @@ class StreamingReadManager:
             now = time.monotonic()
             if waiting_since is None:
                 waiting_since = now
-            elif now - waiting_since >= DOWNLOAD_TURN_YIELD_SECONDS and pool.contended - {member}:
+            waited = now - waiting_since
+            if budget is not None and session.confirmation_waited + waited >= budget:
+                session.confirmation_timed_out = True
+                return "streaming publication's channel wait budget"
+            if waited >= DOWNLOAD_TURN_YIELD_SECONDS and pool.contended - {member, own_publications}:
+                session.confirmation_waited += waited
                 return "streaming publication yielded to other work"
             return None
 

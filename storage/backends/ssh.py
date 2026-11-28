@@ -198,6 +198,10 @@ class SSHBackend(Backend):
     def background_range_capacity(self) -> int:
         return self._pool.bulk_capacity()
 
+    def interactive_wait_budget(self) -> float:
+        # The pool's deadline for an interactive acquisition.
+        return self._pool.connect_timeout
+
     def run_background_range_read(self, virtual_path, fetch):
         # read_file reuses this lease. A range may be claimed only after
         # capacity is acquired, so a reader can use the interactive reserve
