@@ -129,12 +129,20 @@ def _copy_file(src: Path, dst: Path, *, download: bool = False):
             if not stat.S_ISREG(st.st_mode):
                 raise OSError(errno.EINVAL, "not a regular file", str(src))
             os.set_blocking(fd, True)
-            fin = os.fdopen(fd, "rb")
+            bound.source_stats.append(st)
+            # Unbuffered: every read is one read(2) of at most what
+            # copy_bounded_stream asks for, so the descriptor never reads
+            # past cap + 1 bytes.
+            fin = os.fdopen(fd, "rb", buffering=0)
         except BaseException:
             os.close(fd)
             raise
         with fin, open(dst, "wb") as fout:
             copy_bounded_stream(fin.read, fout.write, bound)
+            # The copied descriptor's own stat once its bytes are read: a
+            # write during the copy, or another file opened at the name,
+            # shows here even if the name is back at the probe's version.
+            bound.source_stats.append(os.fstat(fin.fileno()))
     keep = {name for name in _listxattr(src) if not _is_internal_xattr(name)}
     for name in _listxattr(dst):
         if name.startswith(_INTERNAL_XATTR_PREFIX) and name not in keep:

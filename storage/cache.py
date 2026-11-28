@@ -84,10 +84,32 @@ class NewFileReservation:
         self.inode = inode  # (st_dev, st_ino)
 
 
-def _denies_owner_read(st) -> bool:
-    """Whether a member stat reports a mode without owner read (root aside)."""
+def _denying_mode(st, current: Optional[int]) -> Optional[int]:
+    """The first mode a fill's stats reported without owner read (root aside)."""
+    if current is not None:
+        return current
     mode = getattr(st, "st_mode", None)
-    return os.geteuid() != 0 and type(mode) is int and not mode & stat_module.S_IRUSR
+    if os.geteuid() != 0 and type(mode) is int and not mode & stat_module.S_IRUSR:
+        return mode
+    return None
+
+
+def _token_contradicts(fd_st, path_st) -> bool:
+    """Whether two stats that both carry a version token (size and mtime) disagree on it."""
+    if not (has_version_token(fd_st) and has_version_token(path_st)):
+        return False
+    return (fd_st.st_size != path_st.st_size
+            or _member_mtime_ns(fd_st) != _member_mtime_ns(path_st))
+
+
+def _with_mode(st, mode: int):
+    """A copy of a member stat (or None) that reports mode."""
+    from types import SimpleNamespace
+    fields = {key: getattr(st, key, None) for key in (
+        "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size", "st_mtime", "st_mtime_ns",
+        "st_atime", "st_atime_ns")}
+    fields["st_mode"] = mode
+    return SimpleNamespace(**fields)
 
 
 class CacheFetch(Enum):
@@ -675,7 +697,7 @@ class CacheManager:
             token_seen = has_version_token(member_stat)
             # Any stat of the fill that withheld owner read: a private copy
             # is then refused, whatever a later stat (or none) reports.
-            read_denied = _denies_owner_read(member_stat)
+            denying_mode = _denying_mode(member_stat, None)
             for attempt in range(2):
                 if attempt:
                     temp_path.unlink(missing_ok=True)
@@ -704,15 +726,18 @@ class CacheManager:
                 # unconfirmed version gets one more confirmation. Only AGREED
                 # and NEVER_VERSIONED are installed (sticky versioning: once
                 # any stat of this fill carried a token, never NEVER_VERSIONED).
+                # At most two confirming stats per transfer, across the
+                # retry inside confirm_member_stat and the second call.
+                budget = StatBudget(2)
                 newest, version = confirm_member_stat(
-                    backend, source_virtual_path, member_stat, st.st_size)
+                    backend, source_virtual_path, member_stat, st.st_size, budget)
                 token_seen = token_seen or has_version_token(newest)
-                read_denied = read_denied or _denies_owner_read(newest)
-                if version == MemberVersion.UNCONFIRMED:
+                denying_mode = _denying_mode(newest, denying_mode)
+                if version == MemberVersion.UNCONFIRMED and budget.remaining:
                     newest, version = confirm_member_stat(
-                        backend, source_virtual_path, member_stat, st.st_size)
+                        backend, source_virtual_path, member_stat, st.st_size, budget)
                     token_seen = token_seen or has_version_token(newest)
-                    read_denied = read_denied or _denies_owner_read(newest)
+                    denying_mode = _denying_mode(newest, denying_mode)
                 # A stat that showed another version with a token: the only
                 # one a retry may be confirmed against.
                 newer = newest if version == MemberVersion.CHANGED else None
@@ -720,6 +745,14 @@ class CacheManager:
                     version = MemberVersion.UNCONFIRMED
                 if bound is not None and bound.grew:
                     # The source outran the bounded copy: another version.
+                    version = MemberVersion.CHANGED
+                if bound is not None and any(
+                        _token_contradicts(fd_st, other)
+                        for fd_st in bound.source_stats for other in (member_stat, newest)):
+                    # The descriptor actually copied was at another version
+                    # than the pathname stats (renamed away and back, or
+                    # written during the copy): whatever they agree on, these
+                    # bytes are not theirs.
                     version = MemberVersion.CHANGED
                 if fill_action(version, read_only=False) == FillAction.INSTALL:
                     break
@@ -730,7 +763,8 @@ class CacheManager:
                         or not has_version_token(newer)):
                     break
                 member_stat = newest
-                # Reserve for the retry: the newer stat's size (pre-#191 budget).
+                # The retry's cap: the larger of this fill's cap and the
+                # newer stat's size; only the difference is reserved more.
                 more = (max(0, newest.st_size - (reserved + extra_reserved))
                         if reserved is not None else 0)
                 if more:
@@ -749,7 +783,13 @@ class CacheManager:
                 # never linked into the cache, and takes over this fill's
                 # reservation for its size before cache_file_result releases
                 # its own (no window).
-                if private is not None and cap is not None and not read_denied:
+                if denying_mode is not None:
+                    # A read denial seen in this fill wins over any copy, the
+                    # last good one included (the open reports EACCES).
+                    self._fill_errno.code = errno.EACCES
+                    raise OSError(errno.EACCES, f"the member withheld read of {source_virtual_path}",
+                                  source_virtual_path)
+                if private is not None and cap is not None:
                     kept = temp_path.with_name(f".{secrets.token_hex(8)}.private{PARTIAL_SUFFIX}")
                     os.rename(temp_path, kept)
                     try:
@@ -767,13 +807,14 @@ class CacheManager:
                         value = getattr(newest, key, None)
                         known[key] = getattr(member_stat, key, None) if value is None else value
                     private.append((kept, reservation, known))
-                elif private is not None and read_denied:
-                    self._fill_errno.code = errno.EACCES
-                    raise OSError(errno.EACCES, f"the member withheld read of {source_virtual_path}",
-                                  source_virtual_path)
                 self._fill_errno.code = errno.EAGAIN
                 raise OSError(errno.EAGAIN, f"the member's version of {source_virtual_path} "
                               f"could not be confirmed ({version})", source_virtual_path)
+            if denying_mode is not None:
+                # Installed although a stat of this fill withheld owner read
+                # (say, a confirmation without a mode after one with 0o200):
+                # the recorded mode keeps that denial.
+                newest = _with_mode(newest, denying_mode)
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 copy_member_attributes(fd, newest)

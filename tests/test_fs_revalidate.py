@@ -2666,6 +2666,74 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
                          SyncStatus.CLEAN)
 
+    def test_a_denial_in_any_confirmation_survives_a_mode_less_one(self):
+        # Probe: a token, no mode. First confirmation: 0o200 and no mtime
+        # (UNCONFIRMED). Second: a token without a mode (AGREED), so no
+        # stat of the installed version reports a mode.
+        self.rewrite_member("f.txt", b"secret", mtime=1_000_000_000)
+        real, calls = self.member.stat, []
+
+        def stats(path):
+            calls.append(path)
+            st = real(path)
+            if len(calls) == 2:
+                return SimpleNamespace(st_size=st.st_size, st_mode=stat.S_IFREG | 0o200)
+            return SimpleNamespace(st_size=st.st_size, st_mtime_ns=st.st_mtime_ns)
+
+        with patch.object(self.member, "stat", side_effect=stats):
+            self.assert_errno(errno.EACCES, self.fs.open, "/f.txt", os.O_RDONLY)
+        self.assertEqual(len(calls), 3)
+        # Whatever is installed is never readable through the mount.
+        self.assert_errno(errno.EACCES, self.fs.open, "/f.txt", os.O_RDONLY)
+
+    def test_the_copied_descriptor_contradicting_the_path_publishes_nothing(self):
+        # A is renamed away and a same-size B with another mtime opened; A
+        # is back before the confirmation, so the pathname stats agree.
+        from storage.backends import local
+        self.rewrite_member("f.txt", b"AAAAAAAA", mtime=1_000_000_000)
+        src = self.member_dir / "f.txt"
+        aside = self.member_dir / "f.txt.aside"
+        real_open, swapped = local.os.open, []
+
+        def swapping_open(path, flags, *a, **kw):
+            if str(path) == str(src) and not swapped:
+                swapped.append(path)
+                os.rename(src, aside)
+                src.write_bytes(b"BBBBBBBB")
+                os.utime(src, (1_200_000_000, 1_200_000_000))
+                try:
+                    return real_open(path, flags, *a, **kw)
+                finally:
+                    os.replace(aside, src)
+            return real_open(path, flags, *a, **kw)
+
+        uploads = patch.object(self.member, "copy_from_local",
+                               side_effect=AssertionError("upload"))
+        with patch.object(local.os, "open", side_effect=swapping_open), uploads:
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/f.txt", os.O_RDWR)
+        self.assertTrue(swapped)
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual(self.partials(), [])
+        # Unmolested, the same file installs.
+        self.assertEqual(self.read_through("/f.txt"), b"AAAAAAAA")
+
+    def test_the_local_copy_reads_no_more_than_the_cap_plus_one_at_the_descriptor(self):
+        from storage.backends import base, local
+        src = self.rewrite_member("big.bin", b"z" * (1 << 20))
+        consumed = []
+        real_stream = local.copy_bounded_stream
+
+        def stream(read, write, bound):
+            real_stream(read, write, bound)
+            consumed.append(os.lseek(read.__self__.fileno(), 0, os.SEEK_CUR))
+
+        with patch.object(local, "copy_bounded_stream", side_effect=stream), \
+                base.bounded_copy(100) as bound:
+            self.member.copy_to_local("/big.bin", self.temp_dir / "out")
+        self.assertEqual(consumed, [101])
+        self.assertTrue(bound.grew)
+        del src
+
     def refresh_raising(self, method, exc, writer_errno):
         self.changed_v1()
         with patch.object(self.member, method, side_effect=exc):
@@ -2696,6 +2764,20 @@ class TestRefreshRound5(RevalidateTestBase):
                 self.count_fetches() as fetches:
             self.assertEqual(self.read_through("/f.txt"), b"original")
         self.assertEqual(fetches.call_count, 0)
+
+    def test_a_fill_makes_at_most_two_confirming_stats(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        real, calls = self.member.stat, []
+
+        def stats(path):
+            calls.append(path)
+            if len(calls) == 1:
+                return real(path)  # the probe
+            raise OSError(errno.EIO, "stat failed")
+
+        with patch.object(self.member, "stat", side_effect=stats):
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/f.txt", os.O_RDWR)
+        self.assertEqual(len(calls), 3)  # the probe and two confirmations
 
 
 if __name__ == "__main__":

@@ -156,6 +156,10 @@ class _FakeRemoteFile:
         # paramiko 4 queues read-ahead for [0, file_size) only.
         self._sftp.server.prefetches.append(file_size)
 
+    def stat(self):
+        # SFTPFile.stat(): the open handle's attributes (an fstat request).
+        return SimpleNamespace(st_size=len(self._data), st_mode=0o100644, st_mtime=1.0)
+
     def read(self, size: int):
         chunk = self._data[self._offset:self._offset + size]
         self._offset += len(chunk)

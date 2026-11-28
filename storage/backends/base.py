@@ -63,6 +63,9 @@ class CopyBound:
         self.grew = False
         self.written = 0
         self.read = 0
+        # Stats of the open source itself (fstat), when the backend has them:
+        # the version actually copied, whatever its pathname says later.
+        self.source_stats: list = []
 
 
 _COPY_BOUND: contextvars.ContextVar = contextvars.ContextVar("copy_bound", default=None)

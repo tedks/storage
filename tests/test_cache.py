@@ -310,6 +310,9 @@ class TestBoundedCopy(unittest.TestCase):
             def prefetch(self, file_size=None, max_concurrent_requests=None):
                 prefetches.append(file_size)
 
+            def stat(self):
+                return SimpleNamespace(st_size=len(data), st_mtime=2.0)
+
         prefetches = []
         remote = GrowingRemote()
         requested = []
@@ -334,6 +337,8 @@ class TestBoundedCopy(unittest.TestCase):
         self.assertEqual(prefetches, [self.CAP])
         self.assertEqual(sum(requested[:-1]), self.CAP)
         self.assertEqual(requested[-1], 1)
+        # The open handle's own attributes are the copy's evidence (S4).
+        self.assertEqual([st.st_mtime for st in bound.source_stats], [2.0])
 
     def test_ssh_copy_is_not_replayed_after_the_source_opened(self):
         from types import SimpleNamespace

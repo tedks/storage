@@ -586,6 +586,10 @@ class SSHBackend(Backend):
             with sftp.open(remote_path, "rb") as fin, open(local_path, "wb") as fout:
                 fin.prefetch(bound.cap)
                 copy_bounded_stream(fin.read, fout.write, bound)
+                # The open handle's own attributes (one SFTP fstat round
+                # trip): the version the bytes came from, whatever the path
+                # names by the confirmation.
+                bound.source_stats.append(fin.stat())
 
         # Not retried: a copy whose connection drops after the source was
         # opened fails with that error, never reopens and copies again (one
