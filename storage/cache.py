@@ -345,7 +345,10 @@ class CacheManager:
             for virtual_path in self.state_manager.iter_lru_paths(recomputable=recomputable):
                 cache_path = self.get_cache_path(virtual_path)
                 with self._path_guard(virtual_path) as free:
-                    if not free or regular_file_stat(cache_path) is None:
+                    if not free:
+                        continue
+                    if regular_file_stat(cache_path) is None:
+                        self._note_cache_absent(virtual_path, cache_path)
                         continue
                     try:
                         freed += self._evict_if_still_clean(
@@ -600,7 +603,21 @@ class CacheManager:
                 self.store_file_metadata(row, cache_path=cache_path)
             else:
                 self.state_manager.remove_file_location(virtual_path, "cache")
+                self._note_cache_absent(virtual_path, cache_path)
             return st.st_size
+
+    def _note_cache_absent(self, virtual_path: str, cache_path: Path):
+        """Drop a path with no cache file from later eviction scans until its row is written.
+
+        The mark goes in before the second stat: bytes placed after that
+        stat are followed by a row write, whose trigger drops the mark,
+        and bytes placed before it are seen here. No path writes the row
+        before it places the bytes, so a mark can only hide a file the
+        cache does not hold.
+        """
+        self.state_manager.mark_cache_absent(virtual_path)
+        if regular_file_stat(cache_path) is not None:
+            self.state_manager.clear_cache_absent(virtual_path)
 
     @staticmethod
     def _truncate_recomputable(cache_path: Path, st: os.stat_result) -> Optional[os.stat_result]:

@@ -220,6 +220,30 @@ class StateManager:
             ON files(sync_status, recomputable, last_access, virtual_path)
             WHERE link_target IS NULL
         ''')
+        # Rows whose cache file eviction last found missing, so the scan
+        # does not lstat every row ever evicted (iter_lru_paths). A hint,
+        # never the record of anything: any write to the row (insert,
+        # update, delete, rename) drops it through the triggers, and an
+        # empty table only costs one full scan. Every path that places
+        # bytes in the cache writes the row after the bytes are in place,
+        # which is what re-admits the path (CacheManager._note_cache_absent).
+        self.conn.executescript('''
+            CREATE TABLE IF NOT EXISTS cache_absent (
+                virtual_path TEXT PRIMARY KEY
+            );
+            CREATE TRIGGER IF NOT EXISTS cache_absent_on_insert AFTER INSERT ON files
+            BEGIN
+                DELETE FROM cache_absent WHERE virtual_path = NEW.virtual_path;
+            END;
+            CREATE TRIGGER IF NOT EXISTS cache_absent_on_update AFTER UPDATE ON files
+            BEGIN
+                DELETE FROM cache_absent WHERE virtual_path IN (OLD.virtual_path, NEW.virtual_path);
+            END;
+            CREATE TRIGGER IF NOT EXISTS cache_absent_on_delete AFTER DELETE ON files
+            BEGIN
+                DELETE FROM cache_absent WHERE virtual_path = OLD.virtual_path;
+            END;
+        ''')
         self.conn.commit()
 
     def _flush_access_updates(self, force: bool = False):
@@ -932,11 +956,27 @@ class StateManager:
             )
         self._flush_access_updates()
 
-    def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
-        """Walk CLEAN regular-file rows in access order, including evicted rows.
+    def mark_cache_absent(self, virtual_path: str):
+        """Record that eviction found no regular cache file for the row (see cache_absent)."""
+        self._execute_write(
+            'INSERT OR IGNORE INTO cache_absent (virtual_path) VALUES (?)', (virtual_path,),
+        )
 
-        The cache tree is authoritative for whether the bytes are present.
-        Page past missing and pinned paths without loading the whole index.
+    def clear_cache_absent(self, virtual_path: str):
+        self._execute_write('DELETE FROM cache_absent WHERE virtual_path = ?', (virtual_path,))
+
+    def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
+        """Walk CLEAN regular-file rows with bytes to free, in access order.
+
+        The cache tree is authoritative for whether the bytes are present,
+        so evicted rows are walked too, except rows whose file eviction
+        already found missing and that no write has touched since
+        (cache_absent). Rows of size 0 free nothing: an evicted
+        recomputable placeholder, or an empty file. A file that grew under
+        a size-0 CLEAN row is a stale CLEAN, which the open path and the
+        post-crash sweep heal; eviction would only mark it dirty and keep
+        it. Page past missing and pinned paths without loading the whole
+        index.
         """
         self._flush_access_updates(force=True)
         last_access, last_path = float('-inf'), ''
@@ -945,6 +985,10 @@ class StateManager:
                 rows = self.conn.execute('''
                     SELECT virtual_path, last_access FROM files
                     WHERE sync_status = ? AND recomputable = ? AND link_target IS NULL
+                      AND size > 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cache_absent WHERE cache_absent.virtual_path = files.virtual_path
+                      )
                       AND (last_access, virtual_path) > (?, ?)
                     ORDER BY last_access ASC, virtual_path ASC
                     LIMIT ?
